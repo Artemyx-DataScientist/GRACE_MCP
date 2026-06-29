@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "grace-orchestrator-mcp"
+version = "0.1.0"
+description = "Local MCP control-plane ledger for GRACE multi-agent development"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp[cli]>=1.17,<2.0",
+  "pydantic>=2.7,<3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9.0"]
+
+[project.scripts]
+grace-orchestrator-mcp = "grace_orchestrator.__main__:main"
+grace-host-continuation = "grace_orchestrator.host_continuation:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --basetemp=.pytest-tmp"
+pythonpath = ["src"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/grace_orchestrator"]

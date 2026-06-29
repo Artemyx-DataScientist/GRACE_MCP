@@ -323,6 +323,7 @@ class OrchestratorService:
         task_forbidden = _loads(str(task["forbidden_files_json"]))
         self._validate_scope_patterns(task_allowed, "Task allowed")
         self._validate_scope_patterns(task_forbidden, "Task forbidden")
+        files_changed = payload.get("files_changed")
         if package is not None:
             package_allowed = _loads(str(package["allowed_files_json"]))
             package_forbidden = _loads(str(package["forbidden_files_json"]))
@@ -332,7 +333,6 @@ class OrchestratorService:
                 self._scope_is_subset(task_allowed, pattern) for pattern in package_allowed
             ):
                 raise OrchestratorError("Hook rejected a work package outside the parent task scope")
-            files_changed = payload.get("files_changed")
             if files_changed is not None:
                 if not isinstance(files_changed, Sequence) or isinstance(files_changed, (str, bytes)):
                     raise OrchestratorError("Hook submission files must be a sequence")
@@ -341,6 +341,14 @@ class OrchestratorService:
                     allowed_files=package_allowed,
                     forbidden_files=package_forbidden,
                 )
+        elif files_changed is not None:
+            if not isinstance(files_changed, Sequence) or isinstance(files_changed, (str, bytes)):
+                raise OrchestratorError("Hook submission files must be a sequence")
+            validate_scoped_files(
+                [str(item) for item in files_changed],
+                allowed_files=task_allowed,
+                forbidden_files=task_forbidden,
+            )
         artifact_path = payload.get("artifact_path")
         if artifact_path is not None:
             project = self._project(int(task["project_id"]))
@@ -559,6 +567,8 @@ class OrchestratorService:
         if mimo_model is not None and not normalized_model:
             raise OrchestratorError("Mimo model must be a non-empty provider/model identifier when supplied")
         capability_values = sorted({role.value for role in capabilities} | {primary_role.value})
+        if primary_role == OrchestratorRole.WORKER_JUNIOR and capability_values != [OrchestratorRole.WORKER_JUNIOR.value]:
+            raise OrchestratorError("Junior agents cannot be registered with fallback role capabilities")
         timestamp = _now()
         with self.store.transaction() as conn:
             conn.execute(
@@ -727,9 +737,11 @@ class OrchestratorService:
         if expires_at.tzinfo is None:
             raise OrchestratorError("Role delegation expiry must be timezone-aware")
         try:
-            self._require_available_capability(project_id, substitute_actor, delegated_role)
+            substitute = self._require_available_capability(project_id, substitute_actor, delegated_role)
         except OrchestratorError as error:
             raise OrchestratorError(str(error).replace("Assigned agent", "Fallback substitute")) from error
+        if substitute["primary_role"] == OrchestratorRole.WORKER_JUNIOR.value:
+            raise OrchestratorError("Junior agents cannot receive fallback delegation")
         owner_primary_roles = (
             (OrchestratorRole.GLM.value, OrchestratorRole.TEST_OWNER.value)
             if unavailable_role == OrchestratorRole.TEST_OWNER
@@ -1421,6 +1433,110 @@ class OrchestratorService:
         submission["handoff_report_path"] = report_path
         return submission
         # END_BLOCK_COMMIT_SCOPE_VALIDATED_CONTROLLER_REPAIR
+
+    def submit_controller_task_completion(
+        self,
+        actor: ActorIdentity,
+        task_id: int,
+        summary: str,
+        evidence: SubmissionEvidence,
+        tests_run: Sequence[Mapping[str, object]],
+        risk_notes: str,
+        controller_report: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        # START_CONTRACT: OrchestratorService.submit_controller_task_completion
+        #   PURPOSE: Persist audited Codex controller-owned completion evidence when no worker package is required.
+        #   INPUTS: { actor: Codex, task_id: int, evidence: task-scope diff, controller_report: mapping }
+        #   OUTPUTS: { dict - immutable task review record marking the GLM gate satisfied }
+        #   SIDE_EFFECTS: Inserts task review, advances task to GLM_ACCEPTED, appends audit/hook events atomically.
+        #   LINKS: M-ORCH-LEDGER, V-M-ORCH-LEDGER, M-ORCH-DOMAIN
+        # END_CONTRACT: OrchestratorService.submit_controller_task_completion
+        # START_BLOCK_COMMIT_CONTROLLER_OWNED_COMPLETION
+        task = self._task(task_id)
+        effective = self._authorize(actor, OrchestratorRole.CODEX, task["project_id"], task_id)
+        package_count = self.store.fetchone("SELECT COUNT(*) AS count FROM work_packages WHERE task_id = ?", (task_id,))["count"]
+        if package_count:
+            raise OrchestratorError("Controller task completion is only allowed when the task has no work packages")
+        if TaskStatus(task["status"]) not in {TaskStatus.GLM_GRACE_PLANNED, TaskStatus.GLM_TESTS_PREPARED}:
+            raise OrchestratorError("Controller task completion requires a planned task with no worker packages")
+        allowed_files = _loads(task["allowed_files_json"])
+        forbidden_files = _loads(task["forbidden_files_json"])
+        validate_scoped_files(evidence.files_changed, allowed_files=allowed_files, forbidden_files=forbidden_files)
+        project = self._project(task["project_id"])
+        report_gate = policy_validate_worker_report(
+            controller_report,
+            task_id=task_id,
+            work_package_id=0,
+            allowed_files=allowed_files,
+            forbidden_files=forbidden_files,
+            evidence_files=evidence.files_changed,
+            repo_root=Path(project["repo_path"]),
+        )
+        require_gate_pass(report_gate, "Controller task completion report validation")
+        timestamp = _now()
+        completion_payload = {
+            "summary": summary,
+            "evidence": {
+                "base_commit": evidence.base_commit,
+                "head_commit": evidence.head_commit,
+                "diff_hash": evidence.diff_hash,
+                "files_changed": list(evidence.files_changed),
+            },
+            "tests_run": list(tests_run),
+            "risk_notes": risk_notes,
+            "controller_report": dict(controller_report),
+            "controller_report_validation": report_gate,
+        }
+        with self.store.transaction() as conn:
+            cursor = conn.execute(
+                """INSERT INTO reviews (
+                    target_type, target_id, reviewer_role, reviewer_agent, effective_role,
+                    decision, findings_json, required_fixes_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "task",
+                    task_id,
+                    actor.primary_role.value,
+                    actor.name,
+                    effective.value,
+                    "controller_completed",
+                    _json([completion_payload]),
+                    _json([]),
+                    timestamp,
+                ),
+            )
+            review_id = int(cursor.lastrowid)
+            self._audit(
+                conn,
+                actor,
+                effective,
+                "gate.validate_controller_task_completion_report",
+                "review",
+                review_id,
+                {"status": report_gate["status"], "issues": report_gate["issues"], "warnings": report_gate["warnings"]},
+            )
+            self._audit(
+                conn,
+                actor,
+                effective,
+                "submission.controller_task_completion_created",
+                "review",
+                review_id,
+                {"task_id": task_id, "diff_hash": evidence.diff_hash, "files_changed": list(evidence.files_changed)},
+            )
+            self._advance_task(conn, actor, effective, task, TaskStatus.GLM_ACCEPTED, "task.controller_completion_accepted")
+            self._dispatch_hook(
+                conn,
+                actor,
+                effective,
+                HookEvent.GLM_ACCEPTED,
+                self._task(task_id),
+                payload={"review_id": review_id, "files_changed": evidence.files_changed, "controller_owned": True},
+            )
+        review = _row(self.store.fetchone("SELECT * FROM reviews WHERE id = ?", (review_id,)))
+        review["controller_completion"] = completion_payload
+        return review
+        # END_BLOCK_COMMIT_CONTROLLER_OWNED_COMPLETION
 
     def review_package(
         self,
@@ -2139,7 +2255,21 @@ class OrchestratorService:
         warnings: list[str] = []
         packages = self.store.fetchall("SELECT * FROM work_packages WHERE task_id = ? ORDER BY id", (task_id,))
         if not packages:
-            issues.append("Acceptance gate requires at least one work package")
+            completion = self.store.fetchone(
+                """SELECT * FROM reviews
+                   WHERE target_type = 'task' AND target_id = ? AND decision = 'controller_completed'
+                   ORDER BY id DESC LIMIT 1""",
+                (task_id,),
+            )
+            if completion is None:
+                issues.append("Acceptance gate requires at least one work package or audited controller task completion")
+            elif task["status"] not in {
+                TaskStatus.GLM_ACCEPTED.value,
+                TaskStatus.CODEX_FINAL_REVIEW.value,
+                TaskStatus.CODEX_ACCEPTED.value,
+                TaskStatus.TASK_CLOSED.value,
+            }:
+                issues.append("Audited controller task completion has not advanced the task to GLM_ACCEPTED")
         for package in packages:
             if package["status"] != WorkPackageStatus.GLM_ACCEPTED.value:
                 issues.append(f"Work package {package['id']} is not GLM_ACCEPTED")

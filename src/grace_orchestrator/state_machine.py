@@ -32,8 +32,14 @@ logger = logging.getLogger(__name__)
 
 TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.CODEX_TASK_CREATED: {TaskStatus.GLM_GRACE_PLANNED},
-    TaskStatus.GLM_GRACE_PLANNED: {TaskStatus.GLM_TESTS_PREPARED},
-    TaskStatus.GLM_TESTS_PREPARED: {TaskStatus.WORK_PACKAGES_CREATED},
+    TaskStatus.GLM_GRACE_PLANNED: {
+        TaskStatus.GLM_TESTS_PREPARED,
+        TaskStatus.GLM_ACCEPTED,
+    },
+    TaskStatus.GLM_TESTS_PREPARED: {
+        TaskStatus.WORK_PACKAGES_CREATED,
+        TaskStatus.GLM_ACCEPTED,
+    },
     TaskStatus.WORK_PACKAGES_CREATED: {TaskStatus.WORK_PACKAGES_ASSIGNED},
     TaskStatus.WORK_PACKAGES_ASSIGNED: {
         TaskStatus.GLM_ACCEPTED,

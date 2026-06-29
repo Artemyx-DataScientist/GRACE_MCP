@@ -24,6 +24,8 @@ from grace_orchestrator.state_machine import assert_task_transition, assert_work
 def test_task_machine_accepts_planned_path() -> None:
     assert_task_transition(TaskStatus.CODEX_TASK_CREATED, TaskStatus.GLM_GRACE_PLANNED)
     assert_task_transition(TaskStatus.GLM_GRACE_PLANNED, TaskStatus.GLM_TESTS_PREPARED)
+    assert_task_transition(TaskStatus.GLM_GRACE_PLANNED, TaskStatus.GLM_ACCEPTED)
+    assert_task_transition(TaskStatus.GLM_TESTS_PREPARED, TaskStatus.GLM_ACCEPTED)
     assert_task_transition(TaskStatus.GLM_ACCEPTED, TaskStatus.CODEX_FINAL_REVIEW)
     assert_task_transition(TaskStatus.CODEX_FINAL_REVIEW, TaskStatus.CODEX_ACCEPTED)
     assert_task_transition(TaskStatus.CODEX_ACCEPTED, TaskStatus.TASK_CLOSED)

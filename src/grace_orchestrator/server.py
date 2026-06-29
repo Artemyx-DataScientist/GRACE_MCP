@@ -70,6 +70,7 @@ REQUIRED_TOOLS = {
     "workpackage.claim",
     "submission.create",
     "submission.controller_repair",
+    "submission.controller_task_completion",
     "review.glm_submit",
     "review.codex_submit",
     "repo.status",
@@ -100,8 +101,8 @@ def _plain(value: Any) -> Any:
 def _next_action(status: str) -> dict[str, str]:
     actions = {
         "CODEX_TASK_CREATED": {"role": "glm", "action": "task.plan"},
-        "GLM_GRACE_PLANNED": {"role": "glm", "action": "verification.register_plan"},
-        "GLM_TESTS_PREPARED": {"role": "glm", "action": "workpackage.create"},
+        "GLM_GRACE_PLANNED": {"role": "glm", "action": "verification.register_plan or submission.controller_task_completion"},
+        "GLM_TESTS_PREPARED": {"role": "glm", "action": "workpackage.create or submission.controller_task_completion"},
         "WORK_PACKAGES_CREATED": {"role": "glm", "action": "workpackage.assign"},
         "WORK_PACKAGES_ASSIGNED": {"role": "worker_junior", "action": "workpackage.claim"},
         "GLM_REJECTED_REPAIR_REQUIRED": {"role": "codex", "action": "submission.controller_repair"},
@@ -472,6 +473,31 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             service.submit_controller_repair(
                 actor,
                 work_package_id,
+                summary,
+                evidence,
+                tests_run,
+                risk_notes,
+                controller_report,
+            )
+        )
+
+    @mcp.tool("submission.controller_task_completion", description="Store audited Codex controller-owned task completion evidence when no worker package is required.")
+    def create_controller_task_completion(
+        task_id: int,
+        summary: str,
+        base_commit: str,
+        head_commit: str,
+        tests_run: list[dict[str, Any]],
+        risk_notes: str,
+        controller_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        task = service.get_task(task_id)
+        project = service.get_project(task["project_id"])
+        evidence = RepositoryBoundary(Path(project["repo_path"])).derive_submission(base_commit, head_commit)
+        return _plain(
+            service.submit_controller_task_completion(
+                actor,
+                task_id,
                 summary,
                 evidence,
                 tests_run,

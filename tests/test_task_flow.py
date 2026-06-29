@@ -356,6 +356,125 @@ def test_codex_controller_repair_can_replace_unavailable_pro_submission(tmp_path
     assert service.get_task(task["id"])["status"] == TaskStatus.GLM_ACCEPTED.value
 
 
+def test_controller_owned_task_completion_can_reach_final_review_without_package(tmp_path: Path) -> None:
+    service = OrchestratorService(tmp_path / "ledger.sqlite3")
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    glm = _actor("glm-5.2", OrchestratorRole.GLM)
+    project = service.init_project(codex, "demo", tmp_path, tmp_path / "grace", "main", {})
+    task = service.create_codex_task(
+        codex,
+        project["id"],
+        title="controller slice",
+        objective="close a controller-owned test-owner slice",
+        architecture_intent="Codex acts as temporary GLM/test-owner fallback without a worker package",
+        constraints=["no junior substitution"],
+        non_goals=["no fake worker submission"],
+        acceptance_criteria=["controller evidence is audited"],
+        allowed_files=["src/**"],
+        forbidden_files=["forbidden/**"],
+    )
+    service.plan_task(glm, task["id"])
+    blocked_gate = service.acceptance_review_gate(codex, task["id"])
+    assert blocked_gate["status"] == "blocked"
+    assert "audited controller task completion" in blocked_gate["issues"][0]
+
+    completion = service.submit_controller_task_completion(
+        codex,
+        task["id"],
+        summary="controller-owned slice implemented and verified",
+        evidence=SubmissionEvidence(
+            base_commit="a" * 40,
+            head_commit="b" * 40,
+            diff="diff --git a/src/a.py b/src/a.py",
+            diff_hash="b" * 64,
+            files_changed=["src/a.py"],
+        ),
+        tests_run=[{"command_key": "manual", "exit_code": 0}],
+        risk_notes="No worker package required; Codex owns protected tests and final acceptance.",
+        controller_report=worker_report(task_id=task["id"], package_id=0, files_changed=["src/a.py"]),
+    )
+
+    assert completion["decision"] == "controller_completed"
+    assert completion["controller_completion"]["evidence"]["files_changed"] == ["src/a.py"]
+    assert service.get_task(task["id"])["status"] == TaskStatus.GLM_ACCEPTED.value
+    assert service.acceptance_review_gate(codex, task["id"])["status"] == "pass"
+    for artifact_type, filename in {
+        "requirements": "requirements.xml",
+        "technology": "technology.xml",
+        "development_plan": "development-plan.xml",
+        "verification_plan": "verification-plan.xml",
+        "knowledge_graph": "knowledge-graph.xml",
+        "operational_packets": "operational-packets.xml",
+    }.items():
+        service.upsert_artifact(
+            glm,
+            project["id"],
+            task["id"],
+            artifact_type,
+            f"<{artifact_type} />",
+            f"grace/{filename}",
+        )
+    service.request_final_review(codex, task["id"])
+    service.final_review(codex, task["id"], decision="accepted", findings=[], required_fixes=[])
+    assert service.get_task(task["id"])["status"] == TaskStatus.TASK_CLOSED.value
+
+
+def test_controller_owned_task_completion_cannot_bypass_existing_package(tmp_path: Path) -> None:
+    service = OrchestratorService(tmp_path / "ledger.sqlite3")
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    glm = _actor("glm", OrchestratorRole.GLM)
+    project = service.init_project(codex, "demo", tmp_path, tmp_path / "grace", "main", {"unit": ["python", "-m", "pytest"]})
+    service.register_agent(codex, project["id"], "junior", OrchestratorRole.WORKER_JUNIOR, [OrchestratorRole.WORKER_JUNIOR])
+    service.register_agent(codex, project["id"], "pro", OrchestratorRole.WORKER_PRO, [OrchestratorRole.WORKER_PRO])
+    task = service.create_codex_task(codex, project["id"], "t", "o", "i", [], [], [], ["src/**"], [])
+    service.plan_task(glm, task["id"])
+    service.register_verification_plan(glm, task["id"], "deterministic", ["unit"])
+    service.create_work_package(
+        glm,
+        task["id"],
+        title="package",
+        objective="bounded implementation",
+        allowed_files=["src/**"],
+        forbidden_files=["tests/**"],
+        assigned_junior_agent="junior",
+        assigned_pro_agent="pro",
+        base_commit="a" * 40,
+        **packet_kwargs(),
+    )
+
+    with pytest.raises(OrchestratorError, match="only allowed when the task has no work packages"):
+        service.submit_controller_task_completion(
+            codex,
+            task["id"],
+            summary="invalid bypass",
+            evidence=SubmissionEvidence(
+                base_commit="a" * 40,
+                head_commit="b" * 40,
+                diff="diff --git a/src/a.py b/src/a.py",
+                diff_hash="b" * 64,
+                files_changed=["src/a.py"],
+            ),
+            tests_run=[{"command_key": "unit", "exit_code": 0}],
+            risk_notes="should fail",
+            controller_report=worker_report(task_id=task["id"], package_id=0, files_changed=["src/a.py"]),
+        )
+
+
+def test_junior_cannot_be_registered_as_fallback_capable(tmp_path: Path) -> None:
+    service = OrchestratorService(tmp_path / "ledger.sqlite3")
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    project = service.init_project(codex, "demo", tmp_path, tmp_path / "grace", "main", {})
+
+    with pytest.raises(OrchestratorError, match="Junior agents cannot be registered"):
+        service.register_agent(
+            codex,
+            project["id"],
+            "mimo-auto-junior",
+            OrchestratorRole.WORKER_JUNIOR,
+            [OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.GLM],
+        )
+
+
 def test_final_review_before_package_acceptance_is_rejected(tmp_path: Path) -> None:
     service = OrchestratorService(tmp_path / "ledger.sqlite3")
     codex = _actor("codex", OrchestratorRole.CODEX)

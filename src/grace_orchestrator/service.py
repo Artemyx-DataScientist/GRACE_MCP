@@ -84,6 +84,8 @@ GRACE_ARTIFACT_PATHS = {
 }
 
 HANDOFF_WAIT_RETURN_GRACE_SECONDS = 5.0
+HANDOFF_WAIT_TOOL_CALL_LIMIT_SECONDS = float(os.environ.get("GRACE_HANDOFF_WAIT_TOOL_CALL_LIMIT_SECONDS", "300"))
+HANDOFF_WAIT_TRANSPORT_GRACE_SECONDS = float(os.environ.get("GRACE_HANDOFF_WAIT_TRANSPORT_GRACE_SECONDS", "30"))
 
 
 def _now() -> str:
@@ -2324,7 +2326,10 @@ class OrchestratorService:
             raise OrchestratorError("timeout_seconds must be between 1 and 600")
         _, events_path, _ = self._handoff_paths(task["project_id"], task["id"], work_package_id)
         return_grace = min(HANDOFF_WAIT_RETURN_GRACE_SECONDS, max(0.1, timeout_seconds * 0.02))
-        deadline = time.monotonic() + max(0.0, timeout_seconds - return_grace)
+        requested_wait = max(0.0, timeout_seconds - return_grace)
+        transport_wait = max(0.1, HANDOFF_WAIT_TOOL_CALL_LIMIT_SECONDS - HANDOFF_WAIT_TRANSPORT_GRACE_SECONDS)
+        effective_wait = min(requested_wait, transport_wait)
+        deadline = time.monotonic() + effective_wait
         while True:
             events = (
                 [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -2345,6 +2350,8 @@ class OrchestratorService:
                     "event_count": len(events),
                     "events": [],
                     "events_path": str(events_path),
+                    "requested_timeout_seconds": timeout_seconds,
+                    "effective_timeout_seconds": effective_wait,
                 }
             self._handoff_signal.wait(remaining)
 

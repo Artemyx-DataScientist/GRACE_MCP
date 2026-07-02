@@ -1,5 +1,6 @@
 from pathlib import Path
 import threading
+import time
 
 import pytest
 
@@ -31,6 +32,7 @@ from grace_orchestrator.models import (
     SubmissionEvidence,
     TaskStatus,
 )
+from grace_orchestrator import service as service_module
 from grace_orchestrator.service import GRACE_ARTIFACT_PATHS, OrchestratorService
 from conftest import packet_kwargs, worker_report
 
@@ -260,6 +262,23 @@ def test_controller_wait_returns_structured_timeout(tmp_path: Path) -> None:
     assert result["status"] == "timeout"
     assert result["event_count"] == 0
     assert result["events"] == []
+
+
+def test_controller_wait_caps_long_empty_wait_before_transport_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(service_module, "HANDOFF_WAIT_TOOL_CALL_LIMIT_SECONDS", 0.2)
+    monkeypatch.setattr(service_module, "HANDOFF_WAIT_TRANSPORT_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(service_module, "HANDOFF_WAIT_RETURN_GRACE_SECONDS", 0.01)
+    service, _project, task, codex, _glm, _junior, _pro = _ready_package(tmp_path)
+    package = service.get_task(task["id"])["work_packages"][0]
+
+    started = time.monotonic()
+    result = service.wait_for_handoff_event(codex, package["id"], after_event_count=0, timeout_seconds=600)
+    elapsed = time.monotonic() - started
+
+    assert result["status"] == "timeout"
+    assert result["requested_timeout_seconds"] == 600
+    assert result["effective_timeout_seconds"] <= 0.2
+    assert elapsed < 1.0
 
 
 def test_scope_hook_rolls_back_a_task_with_path_escape(tmp_path: Path) -> None:

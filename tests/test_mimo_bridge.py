@@ -277,6 +277,50 @@ def test_mimo_repair_uses_free_junior_when_pro_is_unavailable(tmp_path: Path) ->
     assert claimed["claimed_by_agent"] == "mimo-2.5"
 
 
+def test_mimo_repair_tui_launch_ignores_superseded_detached_tui(tmp_path: Path) -> None:
+    service, runner, glm, task, package = _ready_service(tmp_path, junior_model="mimo-auto-junior")
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    service.set_agent_availability(codex, task["project_id"], "mimo-2.5-pro", "unavailable")
+    first = service.launch_mimo_session(glm, package["id"], MimoLaunchMode.TUI)
+    assert first["lifecycle_state"] == MimoSessionStatus.TUI_DETACHED.value
+    worker = _actor("mimo-2.5", OrchestratorRole.WORKER_JUNIOR)
+    service.claim_work_package(worker, package["id"])
+
+    repo = Path(service.get_project(task["project_id"])["repo_path"])
+    (repo / "src" / "worker.py").write_text("value = 2\n", encoding="utf-8")
+    _git(repo, "add", "src/worker.py")
+    _git(repo, "commit", "-m", "worker change")
+    rejected_head = _git(repo, "rev-parse", "HEAD")
+    evidence = RepositoryBoundary(repo).derive_submission(package["base_commit"], rejected_head)
+    service.submit_package(
+        worker,
+        package["id"],
+        "worker result",
+        evidence,
+        [],
+        "",
+        worker_report=worker_report(
+            task_id=task["id"],
+            package_id=package["id"],
+            files_changed=["src/worker.py"],
+            module_id="M-ORCH-MIMO-EXECUTOR",
+        ),
+    )
+    service.review_package(glm, package["id"], "rejected_repair_required", ["needs repair"], ["repair it"])
+
+    repair = service.launch_mimo_session(glm, package["id"], MimoLaunchMode.TUI)
+
+    assert repair["id"] != first["id"]
+    assert repair["assigned_agent"] == "mimo-2.5"
+    assert repair["assigned_role"] == OrchestratorRole.WORKER_JUNIOR.value
+    assert repair["mimo_model"] == "mimo-auto-junior"
+    assert repair["lifecycle_state"] == MimoSessionStatus.TUI_DETACHED.value
+    assert len(runner.launches) == 2
+    assert _git(Path(repair["workspace_path"]), "rev-parse", "HEAD") == rejected_head
+    with pytest.raises(OrchestratorError, match=f"active Mimo session: {repair['id']}"):
+        service.launch_mimo_session(glm, package["id"], MimoLaunchMode.TUI)
+
+
 def test_controller_can_recover_orphaned_prepared_session_without_accepting_work(tmp_path: Path) -> None:
     service, _runner, glm, task, package = _ready_service(tmp_path)
     with service.store.transaction() as conn:

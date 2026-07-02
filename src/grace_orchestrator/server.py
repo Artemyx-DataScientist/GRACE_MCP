@@ -105,7 +105,7 @@ def _next_action(status: str) -> dict[str, str]:
         "GLM_TESTS_PREPARED": {"role": "glm", "action": "workpackage.create or submission.controller_task_completion"},
         "WORK_PACKAGES_CREATED": {"role": "glm", "action": "workpackage.assign"},
         "WORK_PACKAGES_ASSIGNED": {"role": "worker_junior", "action": "workpackage.claim"},
-        "GLM_REJECTED_REPAIR_REQUIRED": {"role": "codex", "action": "submission.controller_repair"},
+        "GLM_REJECTED_REPAIR_REQUIRED": {"role": "glm", "action": "mimo.launch_package or submission.controller_repair"},
         "GLM_ACCEPTED": {"role": "codex", "action": "task.request_final_review"},
         "CODEX_FINAL_REVIEW": {"role": "codex", "action": "review.codex_submit"},
         "CODEX_ACCEPTED": {"role": "codex", "action": "task.close"},

@@ -1976,16 +1976,45 @@ class OrchestratorService:
             raise OrchestratorError(
                 f"Assigned agent {assigned_agent!r} has no configured Mimo model; register mimo_model first"
             )
-        active_session = self.store.fetchone(
-            """SELECT id FROM mimo_sessions WHERE work_package_id = ?
-               AND lifecycle_state IN (?, ?, ?) ORDER BY id DESC LIMIT 1""",
-            (
-                package["id"],
-                MimoSessionStatus.PREPARED.value,
-                MimoSessionStatus.RUNNING.value,
-                MimoSessionStatus.TUI_DETACHED.value,
-            ),
-        )
+        detached_tui_cutoff = None
+        if package_status == WorkPackageStatus.REPAIR_REQUIRED:
+            latest_rejection = self.store.fetchone(
+                """SELECT created_at FROM reviews
+                   WHERE target_type = 'work_package'
+                     AND target_id = ?
+                     AND decision = 'rejected_repair_required'
+                   ORDER BY id DESC LIMIT 1""",
+                (package["id"],),
+            )
+            if latest_rejection is not None:
+                detached_tui_cutoff = str(latest_rejection["created_at"])
+        if detached_tui_cutoff is None:
+            active_session = self.store.fetchone(
+                """SELECT id FROM mimo_sessions WHERE work_package_id = ?
+                   AND lifecycle_state IN (?, ?, ?) ORDER BY id DESC LIMIT 1""",
+                (
+                    package["id"],
+                    MimoSessionStatus.PREPARED.value,
+                    MimoSessionStatus.RUNNING.value,
+                    MimoSessionStatus.TUI_DETACHED.value,
+                ),
+            )
+        else:
+            active_session = self.store.fetchone(
+                """SELECT id FROM mimo_sessions WHERE work_package_id = ?
+                   AND (
+                       lifecycle_state IN (?, ?)
+                       OR (lifecycle_state = ? AND created_at >= ?)
+                   )
+                   ORDER BY id DESC LIMIT 1""",
+                (
+                    package["id"],
+                    MimoSessionStatus.PREPARED.value,
+                    MimoSessionStatus.RUNNING.value,
+                    MimoSessionStatus.TUI_DETACHED.value,
+                    detached_tui_cutoff,
+                ),
+            )
         if active_session is not None:
             raise OrchestratorError(
                 f"Work package already has an active Mimo session: {int(active_session['id'])}"

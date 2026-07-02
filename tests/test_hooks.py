@@ -20,7 +20,7 @@ import pytest
 #   test_* - named hook effects and failure rollback evidence.
 # END_MODULE_MAP
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v0.3.0 - Added transactional EventBus and hook policy acceptance coverage.
+#   LAST_CHANGE: v0.3.1 - Cover ten-minute handoff wait bound.
 # END_CHANGE_SUMMARY
 
 from grace_orchestrator.hooks import HookEvent, HookRegistry
@@ -31,7 +31,7 @@ from grace_orchestrator.models import (
     SubmissionEvidence,
     TaskStatus,
 )
-from grace_orchestrator.service import OrchestratorService
+from grace_orchestrator.service import GRACE_ARTIFACT_PATHS, OrchestratorService
 from conftest import packet_kwargs, worker_report
 
 
@@ -179,6 +179,22 @@ def test_final_gate_rejects_missing_artifacts_without_promoting_task(tmp_path: P
     assert service.get_task(task["id"])["status"] == TaskStatus.GLM_ACCEPTED.value
 
 
+def test_final_gate_auto_imports_existing_canonical_grace_docs(tmp_path: Path) -> None:
+    service, project, task, codex, _glm = _accepted_task(tmp_path, artifacts=False)
+    repo_root = Path(str(project["repo_path"]))
+    for artifact_type, relative_path in GRACE_ARTIFACT_PATHS.items():
+        artifact_path = repo_root / relative_path
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text(f"<{artifact_type} />", encoding="utf-8")
+
+    reviewed = service.request_final_review(codex, task["id"])
+
+    assert reviewed["status"] == TaskStatus.CODEX_FINAL_REVIEW.value
+    artifacts = service.get_task(task["id"])["grace_artifacts"]
+    assert {artifact["artifact_type"] for artifact in artifacts} == set(GRACE_ARTIFACT_PATHS)
+    assert {artifact["created_by_agent"] for artifact in artifacts} == {"system:auto-import"}
+
+
 def test_submission_and_controller_review_materialize_closed_handoff_events(tmp_path: Path) -> None:
     service, project, task, codex, glm, junior, _pro = _ready_package(tmp_path)
     package = service.get_task(task["id"])["work_packages"][0]
@@ -220,6 +236,30 @@ def test_controller_wait_is_woken_by_worker_ready_for_review(tmp_path: Path) -> 
     assert not thread.is_alive()
     assert result["status"] == "event"
     assert [event["type"] for event in result["events"]] == ["WORKER_READY_FOR_REVIEW"]
+
+
+def test_controller_wait_accepts_ten_minute_bound_without_sleeping(tmp_path: Path) -> None:
+    service, _project, task, codex, _glm, junior, _pro = _ready_package(tmp_path)
+    package = service.get_task(task["id"])["work_packages"][0]
+    service.claim_work_package(junior, package["id"])
+    _submit(service, junior, package["id"], "b")
+
+    result = service.wait_for_handoff_event(codex, package["id"], after_event_count=0, timeout_seconds=600)
+
+    assert result["status"] == "event"
+    with pytest.raises(OrchestratorError, match="between 1 and 600"):
+        service.wait_for_handoff_event(codex, package["id"], after_event_count=1, timeout_seconds=601)
+
+
+def test_controller_wait_returns_structured_timeout(tmp_path: Path) -> None:
+    service, _project, task, codex, _glm, _junior, _pro = _ready_package(tmp_path)
+    package = service.get_task(task["id"])["work_packages"][0]
+
+    result = service.wait_for_handoff_event(codex, package["id"], after_event_count=0, timeout_seconds=1)
+
+    assert result["status"] == "timeout"
+    assert result["event_count"] == 0
+    assert result["events"] == []
 
 
 def test_scope_hook_rolls_back_a_task_with_path_escape(tmp_path: Path) -> None:

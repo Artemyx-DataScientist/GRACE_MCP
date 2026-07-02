@@ -17,7 +17,7 @@
 #   render_work_package_briefing - creates a non-authoritative scoped worker handoff projection.
 # END_MODULE_MAP
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v0.2.0 - Added the local Mimo CLI bridge with model selection and isolated worktrees.
+#   LAST_CHANGE: v0.2.1 - Inline latest repair findings in rejected-package briefings.
 # END_CHANGE_SUMMARY
 
 from __future__ import annotations
@@ -271,6 +271,16 @@ def render_work_package_briefing(
             ),
             f"Allowed files: {package['allowed_files']}",
             f"Forbidden files: {package['forbidden_files']}",
+            *(
+                [
+                    "",
+                    "## Repair context",
+                    f"Latest rejection findings: {package['repair_findings']}",
+                    f"Required repair fixes: {package['repair_required_fixes']}",
+                ]
+                if package.get("repair_findings") or package.get("repair_required_fixes")
+                else []
+            ),
             "",
             "## Required sequence",
             "1. Read the registered GRACE context and call `workpackage.claim` for this exact package.",

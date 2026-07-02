@@ -62,7 +62,7 @@ class HookContext:
     audit: Callable[[str, Mapping[str, Any]], None]
     validate_scope: Callable[[], None]
     enable_worker_pro: Callable[[], None]
-    require_grace_artifacts: Callable[[], None]
+    require_grace_artifacts: Callable[[], Mapping[str, Any]]
     close_task: Callable[[], None]
 
 
@@ -162,6 +162,7 @@ def _on_codex_accepted(context: HookContext) -> None:
 
 def _on_gate_promoted(context: HookContext) -> None:
     context.validate_scope()
+    details = dict(context.payload)
     if context.payload.get("to_status") == "CODEX_FINAL_REVIEW":
-        context.require_grace_artifacts()
-    context.audit(HookEvent.GATE_PROMOTED.value, dict(context.payload))
+        details["grace_artifacts"] = context.require_grace_artifacts()
+    context.audit(HookEvent.GATE_PROMOTED.value, details)

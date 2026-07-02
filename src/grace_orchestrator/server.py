@@ -434,7 +434,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
         return _plain(service.list_handoff_events(actor, work_package_id))
 
     @mcp.tool("handoff.wait_for_event", description="Wait for a new machine-readable handoff event for one work package.")
-    def wait_for_handoff_event(work_package_id: int, after_event_count: int = 0, timeout_seconds: int = 120) -> dict[str, Any]:
+    def wait_for_handoff_event(work_package_id: int, after_event_count: int = 0, timeout_seconds: int = 600) -> dict[str, Any]:
         return _plain(service.wait_for_handoff_event(actor, work_package_id, after_event_count, timeout_seconds))
 
     @mcp.tool("handoff.report_worker_event", description="Report a closed blocked, needs-controller, or failed worker handoff event.")

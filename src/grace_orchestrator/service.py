@@ -16,7 +16,7 @@
 #   OrchestratorService - sole state-changing facade used by MCP tools.
 # END_MODULE_MAP
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v0.4.1 - Add audited Codex controller repair submissions for unavailable Pro repair paths.
+#   LAST_CHANGE: v0.4.5 - Support iterative rejected-package repair with inline repair briefing context.
 # END_CHANGE_SUMMARY
 
 from __future__ import annotations
@@ -73,6 +73,17 @@ REQUIRED_GRACE_ARTIFACT_TYPES = frozenset(
         "operational_packets",
     }
 )
+
+GRACE_ARTIFACT_PATHS = {
+    "requirements": "docs/requirements.xml",
+    "technology": "docs/technology.xml",
+    "development_plan": "docs/development-plan.xml",
+    "verification_plan": "docs/verification-plan.xml",
+    "knowledge_graph": "docs/knowledge-graph.xml",
+    "operational_packets": "docs/operational-packets.xml",
+}
+
+HANDOFF_WAIT_RETURN_GRACE_SECONDS = 5.0
 
 
 def _now() -> str:
@@ -141,7 +152,7 @@ class _HandoffSignal:
         if self._handle is not None:
             wait_result = self._kernel32.WaitForSingleObject(
                 self._handle,
-                max(0, min(int(timeout_seconds * 1000), 120_000)),
+                max(0, min(int(timeout_seconds * 1000), 600_000)),
             )
             return wait_result == self._WAIT_OBJECT_0
         with self._condition:
@@ -366,7 +377,7 @@ class OrchestratorService:
             (_now(), package["id"]),
         )
 
-    def _require_final_grace_artifacts(self, conn: sqlite3.Connection, task_id: int) -> None:
+    def _require_final_grace_artifacts(self, conn: sqlite3.Connection, task_id: int) -> dict[str, Any]:
         artifact_types = {
             str(row["artifact_type"])
             for row in conn.execute(
@@ -374,10 +385,56 @@ class OrchestratorService:
             ).fetchall()
         }
         missing = sorted(REQUIRED_GRACE_ARTIFACT_TYPES - artifact_types)
+        auto_imported: list[dict[str, object]] = []
+        if missing:
+            task = self._task(task_id)
+            project = self._project(int(task["project_id"]))
+            repo_root = Path(project["repo_path"])
+            timestamp = _now()
+            for artifact_type in tuple(missing):
+                relative_path = GRACE_ARTIFACT_PATHS[artifact_type]
+                artifact_path = repo_root / relative_path
+                if not artifact_path.is_file():
+                    continue
+                content = artifact_path.read_text(encoding="utf-8")
+                revision = int(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(revision), 0) + 1 FROM grace_artifacts WHERE task_id = ? AND artifact_type = ?",
+                        (task_id, artifact_type),
+                    ).fetchone()[0]
+                )
+                cursor = conn.execute(
+                    """INSERT INTO grace_artifacts (
+                        project_id, task_id, artifact_type, path, content, content_hash,
+                        revision, created_by_agent, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        project["id"],
+                        task_id,
+                        artifact_type,
+                        relative_path,
+                        content,
+                        stable_hash(content),
+                        revision,
+                        "system:auto-import",
+                        timestamp,
+                    ),
+                )
+                artifact_types.add(artifact_type)
+                auto_imported.append(
+                    {
+                        "artifact_id": int(cursor.lastrowid),
+                        "artifact_type": artifact_type,
+                        "path": relative_path,
+                        "revision": revision,
+                    }
+                )
+            missing = sorted(REQUIRED_GRACE_ARTIFACT_TYPES - artifact_types)
         if missing:
             raise OrchestratorError(
                 "Codex final review requires GRACE artifacts: " + ", ".join(missing)
             )
+        return {"status": "pass", "auto_imported": auto_imported, "artifact_types": sorted(artifact_types)}
 
     def _dispatch_hook(
         self,
@@ -654,6 +711,48 @@ class OrchestratorService:
         if required_role.value not in agent["capabilities"]:
             raise OrchestratorError(f"Assigned agent {name!r} lacks capability {required_role.value}")
         return agent
+
+    def _has_available_capability(
+        self,
+        project_id: int,
+        name: str,
+        required_role: OrchestratorRole,
+    ) -> bool:
+        try:
+            agent = self.get_agent(project_id, name)
+        except OrchestratorError:
+            return False
+        return agent["availability"] == "available" and required_role.value in agent["capabilities"]
+
+    def _select_repair_mimo_assignment(
+        self,
+        project_id: int,
+        package: Mapping[str, Any],
+    ) -> tuple[str, OrchestratorRole, WorkPackageStatus, str]:
+        if not bool(package["worker_pro_available"]):
+            raise OrchestratorError("Repair dispatch requires a recorded GLM rejection hook")
+        if self._has_available_capability(
+            project_id,
+            str(package["assigned_pro_agent"]),
+            OrchestratorRole.WORKER_PRO,
+        ):
+            return (
+                str(package["assigned_pro_agent"]),
+                OrchestratorRole.WORKER_PRO,
+                WorkPackageStatus.CLAIMED_PRO,
+                "worker_pro",
+            )
+        self._require_available_capability(
+            project_id,
+            str(package["assigned_junior_agent"]),
+            OrchestratorRole.WORKER_JUNIOR,
+        )
+        return (
+            str(package["assigned_junior_agent"]),
+            OrchestratorRole.WORKER_JUNIOR,
+            WorkPackageStatus.CLAIMED_JUNIOR,
+            "free_mimo_junior_repair",
+        )
 
     def create_codex_task(
         self,
@@ -1078,6 +1177,12 @@ class OrchestratorService:
             "assigned role": OrchestratorRole.WORKER_JUNIOR.value,
             "allowed files": list(allowed_files),
             "forbidden files": inherited_forbidden,
+            "worker runtime profile": assigned_junior_agent,
+            "actual worker identity": assigned_junior_agent,
+            "launch mode": MimoLaunchMode.TUI.value,
+            "trust flag": "--trust required for generated worker worktrees",
+            "forbidden model flags": "No --model argument and no paid/API MiMo model identifiers.",
+            "claim identity": assigned_junior_agent,
             "required contracts read": discovery.get("contracts_read", []),
             "contract discovery report": discovery,
             "test surface": list(test_surface or []),
@@ -1175,6 +1280,7 @@ class OrchestratorService:
     def claim_work_package(self, actor: ActorIdentity, package_id: int) -> dict[str, Any]:
         package = self._package(package_id)
         current = WorkPackageStatus(package["status"])
+        task = self._task(package["task_id"])
         if current == WorkPackageStatus.ASSIGNED and actor.name == package["assigned_junior_agent"]:
             required = OrchestratorRole.WORKER_JUNIOR
             target = WorkPackageStatus.CLAIMED_JUNIOR
@@ -1183,9 +1289,15 @@ class OrchestratorService:
                 raise OrchestratorError("Assigned worker_pro is not yet enabled by a recorded GLM rejection hook")
             required = OrchestratorRole.WORKER_PRO
             target = WorkPackageStatus.CLAIMED_PRO
+        elif current == WorkPackageStatus.REPAIR_REQUIRED and actor.name == package["assigned_junior_agent"]:
+            assigned_agent, required, target, _repair_route = self._select_repair_mimo_assignment(
+                task["project_id"],
+                package,
+            )
+            if actor.name != assigned_agent:
+                raise OrchestratorError("Only the assigned repair worker may claim the package")
         else:
             raise OrchestratorError("Only the assigned worker may claim the package in its current state")
-        task = self._task(package["task_id"])
         effective = self._authorize(actor, required, task["project_id"], task["id"])
         self._require_available_capability(task["project_id"], actor.name, required)
         with self.store.transaction() as conn:
@@ -1606,7 +1718,18 @@ class OrchestratorService:
             if decision == "accepted" and package_count > 0 and accepted_count == package_count:
                 self._advance_task(conn, actor, effective, fresh_task, TaskStatus.GLM_ACCEPTED, "task.glm_accepted")
             elif decision != "accepted":
-                self._advance_task(conn, actor, effective, fresh_task, TaskStatus.GLM_REJECTED_REPAIR_REQUIRED, "task.glm_repair_required")
+                if TaskStatus(fresh_task["status"]) == TaskStatus.GLM_REJECTED_REPAIR_REQUIRED:
+                    self._audit(
+                        conn,
+                        actor,
+                        effective,
+                        "task.glm_repair_required_reaffirmed",
+                        "task",
+                        task["id"],
+                        {"status": TaskStatus.GLM_REJECTED_REPAIR_REQUIRED.value, "review_id": review_id},
+                    )
+                else:
+                    self._advance_task(conn, actor, effective, fresh_task, TaskStatus.GLM_REJECTED_REPAIR_REQUIRED, "task.glm_repair_required")
         review = _row(self.store.fetchone("SELECT * FROM reviews WHERE id = ?", (review_id,)))
         handoff_event_type = "CONTROLLER_ACCEPTED" if decision == "accepted" else "CONTROLLER_REWORK_REQUESTED"
         event = self._append_handoff_event(
@@ -1830,20 +1953,20 @@ class OrchestratorService:
             required_role = OrchestratorRole.WORKER_JUNIOR
             workspace_base_commit = package["base_commit"]
         elif package_status == WorkPackageStatus.REPAIR_REQUIRED:
-            if not bool(package["worker_pro_available"]):
-                raise OrchestratorError("Mimo Pro dispatch requires a recorded GLM rejection hook")
-            assigned_agent = package["assigned_pro_agent"]
-            required_role = OrchestratorRole.WORKER_PRO
+            assigned_agent, required_role, _claim_target, repair_route = self._select_repair_mimo_assignment(
+                project["id"],
+                package,
+            )
             repair_submission = self.store.fetchone(
                 "SELECT head_commit FROM submissions WHERE work_package_id = ? ORDER BY id DESC LIMIT 1",
                 (package["id"],),
             )
             if repair_submission is None:
-                raise OrchestratorError("Mimo Pro dispatch requires a submitted worker commit to repair")
+                raise OrchestratorError("Mimo repair dispatch requires a submitted worker commit to repair")
             workspace_base_commit = str(repair_submission["head_commit"])
         else:
             raise OrchestratorError(
-                "Mimo dispatch requires an ASSIGNED junior package or a REPAIR_REQUIRED Pro package"
+                "Mimo dispatch requires an ASSIGNED package or a REPAIR_REQUIRED package"
             )
         agent = self._require_available_capability(project["id"], assigned_agent, required_role)
         model = agent.get("mimo_model")
@@ -1892,7 +2015,13 @@ class OrchestratorService:
                 "mimo.session_prepared",
                 "mimo_session",
                 session_id,
-                {"work_package_id": package["id"], "assigned_agent": assigned_agent, "mode": mode.value},
+                {
+                    "work_package_id": package["id"],
+                    "assigned_agent": assigned_agent,
+                    "assigned_role": required_role.value,
+                    "mode": mode.value,
+                    "repair_route": repair_route if package_status == WorkPackageStatus.REPAIR_REQUIRED else None,
+                },
             )
 
         workspace_path = self.data_root / "worktrees" / f"project-{project['id']}" / f"package-{package['id']}" / f"session-{session_id}"
@@ -1904,6 +2033,17 @@ class OrchestratorService:
             briefing_package = self.get_work_package(package["id"])
             if workspace_base_commit != package["base_commit"]:
                 briefing_package["repair_source_commit"] = workspace_base_commit
+                latest_repair_review = self.store.fetchone(
+                    """SELECT findings_json, required_fixes_json FROM reviews
+                       WHERE target_type = 'work_package'
+                         AND target_id = ?
+                         AND decision = 'rejected_repair_required'
+                       ORDER BY id DESC LIMIT 1""",
+                    (package["id"],),
+                )
+                if latest_repair_review is not None:
+                    briefing_package["repair_findings"] = _loads(str(latest_repair_review["findings_json"]))
+                    briefing_package["repair_required_fixes"] = _loads(str(latest_repair_review["required_fixes_json"]))
             briefing_path.write_text(
                 render_work_package_briefing(
                     session_id=session_id,
@@ -2180,10 +2320,11 @@ class OrchestratorService:
         self._authorize(actor, OrchestratorRole.CODEX, task["project_id"], task["id"])
         if after_event_count < 0:
             raise OrchestratorError("after_event_count must be zero or greater")
-        if not 1 <= timeout_seconds <= 120:
-            raise OrchestratorError("timeout_seconds must be between 1 and 120")
+        if not 1 <= timeout_seconds <= 600:
+            raise OrchestratorError("timeout_seconds must be between 1 and 600")
         _, events_path, _ = self._handoff_paths(task["project_id"], task["id"], work_package_id)
-        deadline = time.monotonic() + timeout_seconds
+        return_grace = min(HANDOFF_WAIT_RETURN_GRACE_SECONDS, max(0.1, timeout_seconds * 0.02))
+        deadline = time.monotonic() + max(0.0, timeout_seconds - return_grace)
         while True:
             events = (
                 [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]

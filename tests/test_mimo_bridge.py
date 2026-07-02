@@ -30,6 +30,7 @@ from grace_orchestrator.models import (
     MimoSessionStatus,
     OrchestratorError,
     OrchestratorRole,
+    WorkPackageStatus,
 )
 from grace_orchestrator.repo import RepositoryBoundary
 from grace_orchestrator.service import OrchestratorService
@@ -216,7 +217,64 @@ def test_mimo_pro_repair_starts_from_the_rejected_worker_commit(tmp_path: Path) 
     repair = service.launch_mimo_session(glm, package["id"], MimoLaunchMode.HEADLESS)
 
     assert _git(Path(repair["workspace_path"]), "rev-parse", "HEAD") == repaired_from
-    assert f"Repair source commit: {repaired_from}" in Path(repair["briefing_path"]).read_text(encoding="utf-8")
+    briefing = Path(repair["briefing_path"]).read_text(encoding="utf-8")
+    assert f"Repair source commit: {repaired_from}" in briefing
+    assert "Latest rejection findings: ['needs repair']" in briefing
+    assert "Required repair fixes: ['repair it']" in briefing
+
+
+def test_mimo_repair_uses_free_junior_when_pro_is_unavailable(tmp_path: Path) -> None:
+    service, runner, glm, task, package = _ready_service(tmp_path, junior_model="mimo-auto-junior")
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    service.set_agent_availability(codex, task["project_id"], "mimo-2.5-pro", "unavailable")
+    first = service.launch_mimo_session(glm, package["id"], MimoLaunchMode.HEADLESS)
+    worker = _actor("mimo-2.5", OrchestratorRole.WORKER_JUNIOR)
+    service.claim_work_package(worker, package["id"])
+    runner.exit_code = 0
+    service.poll_mimo_session(glm, first["id"])
+
+    repo = Path(service.get_project(task["project_id"])["repo_path"])
+    (repo / "src" / "worker.py").write_text("value = 2\n", encoding="utf-8")
+    _git(repo, "add", "src/worker.py")
+    _git(repo, "commit", "-m", "worker change")
+    rejected_head = _git(repo, "rev-parse", "HEAD")
+    evidence = RepositoryBoundary(repo).derive_submission(package["base_commit"], rejected_head)
+    service.submit_package(
+        worker,
+        package["id"],
+        "worker result",
+        evidence,
+        [],
+        "",
+        worker_report=worker_report(
+            task_id=task["id"],
+            package_id=package["id"],
+            files_changed=["src/worker.py"],
+            module_id="M-ORCH-MIMO-EXECUTOR",
+        ),
+    )
+    service.review_package(glm, package["id"], "rejected_repair_required", ["needs repair"], ["repair it"])
+
+    with pytest.raises(OrchestratorError, match="not available"):
+        service.claim_work_package(_actor("mimo-2.5-pro", OrchestratorRole.WORKER_PRO), package["id"])
+
+    repair = service.launch_mimo_session(glm, package["id"], MimoLaunchMode.TUI)
+
+    assert repair["assigned_agent"] == "mimo-2.5"
+    assert repair["assigned_role"] == OrchestratorRole.WORKER_JUNIOR.value
+    assert repair["mimo_model"] == "mimo-auto-junior"
+    assert repair["lifecycle_state"] == MimoSessionStatus.TUI_DETACHED.value
+    assert runner.launches[-1]["model"] == "mimo-auto-junior"
+    assert _git(Path(repair["workspace_path"]), "rev-parse", "HEAD") == rejected_head
+    briefing = Path(repair["briefing_path"]).read_text(encoding="utf-8")
+    assert "Registered agent: mimo-2.5" in briefing
+    assert "Bound role required: worker_junior" in briefing
+    assert f"Repair source commit: {rejected_head}" in briefing
+    assert "Latest rejection findings: ['needs repair']" in briefing
+    assert "Required repair fixes: ['repair it']" in briefing
+    claimed = service.claim_work_package(worker, package["id"])
+    assert claimed["status"] == WorkPackageStatus.CLAIMED_JUNIOR.value
+    assert claimed["claimed_by_agent"] == "mimo-2.5"
 
 
 def test_controller_can_recover_orphaned_prepared_session_without_accepting_work(tmp_path: Path) -> None:

@@ -352,6 +352,32 @@ def test_codex_controller_repair_can_replace_unavailable_pro_submission(tmp_path
     assert repair["submitted_by_agent"] == "codex"
     assert service.get_work_package(package["id"])["status"] == WorkPackageStatus.SUBMITTED.value
     assert repair["handoff_event"]["type"] == "CONTROLLER_REPAIR_SUBMITTED"
+    repeated_rejection = service.review_package(
+        codex,
+        package["id"],
+        decision="rejected_repair_required",
+        findings=["controller repair still missed the contract"],
+        required_fixes=["repair again"],
+    )
+    assert repeated_rejection["decision"] == "rejected_repair_required"
+    assert service.get_task(task["id"])["status"] == TaskStatus.GLM_REJECTED_REPAIR_REQUIRED.value
+
+    repair = service.submit_controller_repair(
+        codex,
+        package["id"],
+        summary="controller repaired scope and tests again",
+        evidence=SubmissionEvidence(
+            base_commit="a" * 40,
+            head_commit="d" * 40,
+            diff="diff --git a/src/a.py b/src/a.py",
+            diff_hash="d" * 64,
+            files_changed=["src/a.py"],
+        ),
+        tests_run=[{"command_key": "unit", "exit_code": 0}],
+        risk_notes="Pro worker unavailable; Codex repaired under controller authority after repeated rejection.",
+        controller_report=worker_report(task_id=task["id"], package_id=package["id"], files_changed=["src/a.py"]),
+    )
+    assert service.get_work_package(package["id"])["status"] == WorkPackageStatus.SUBMITTED.value
     service.review_package(codex, package["id"], decision="accepted", findings=[], required_fixes=[])
     assert service.get_task(task["id"])["status"] == TaskStatus.GLM_ACCEPTED.value
 

@@ -46,6 +46,8 @@ def test_server_declares_required_mcp_surface(tmp_path) -> None:
 
 
 def test_stdio_server_initializes_without_stdout_log_noise(tmp_path: Path) -> None:
+    src_path = str(Path(__file__).resolve().parents[1] / "src")
+
     async def smoke() -> set[str]:
         parameters = StdioServerParameters(
             command=sys.executable,
@@ -56,6 +58,9 @@ def test_stdio_server_initializes_without_stdout_log_noise(tmp_path: Path) -> No
                 "GRACE_ORCHESTRATOR_ACTOR_NAME": "codex",
                 "GRACE_ORCHESTRATOR_ACTOR_ROLE": "codex",
                 "GRACE_ORCHESTRATOR_DATA_DIR": str(tmp_path / "state"),
+                "PYTHONPATH": os.pathsep.join(
+                    part for part in [src_path, os.environ.get("PYTHONPATH", "")] if part
+                ),
             },
         )
         async with stdio_client(parameters) as (read_stream, write_stream):

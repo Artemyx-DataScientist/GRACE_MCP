@@ -18,7 +18,7 @@
 #   assert_work_package_transition - rejects invalid worker and repair states.
 # END_MODULE_MAP
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v0.1.1 - Allow audited Codex controller repair submissions after repair rejection.
+#   LAST_CHANGE: v0.1.2 - Allow degraded free-MiMo junior repair when Pro routing is unavailable.
 # END_CHANGE_SUMMARY
 
 from __future__ import annotations
@@ -74,6 +74,7 @@ WORK_PACKAGE_TRANSITIONS: dict[WorkPackageStatus, set[WorkPackageStatus]] = {
         WorkPackageStatus.REPAIR_REQUIRED,
     },
     WorkPackageStatus.REPAIR_REQUIRED: {
+        WorkPackageStatus.CLAIMED_JUNIOR,
         WorkPackageStatus.CLAIMED_PRO,
         WorkPackageStatus.SUBMITTED,
         WorkPackageStatus.CANCELLED,

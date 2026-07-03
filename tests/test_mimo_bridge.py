@@ -95,7 +95,7 @@ def _actor(name: str, role: OrchestratorRole) -> ActorIdentity:
     return ActorIdentity(name=name, primary_role=role)
 
 
-def _ready_service(tmp_path: Path, *, junior_model: str | None = "xiaomi/mimo-2.5") -> tuple[OrchestratorService, FakeMimoRunner, ActorIdentity, dict[str, object], dict[str, object]]:
+def _ready_service(tmp_path: Path, *, junior_model: str | None = "xiaomi/mimo-v2.5") -> tuple[OrchestratorService, FakeMimoRunner, ActorIdentity, dict[str, object], dict[str, object]]:
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "docs").mkdir()
@@ -113,9 +113,9 @@ def _ready_service(tmp_path: Path, *, junior_model: str | None = "xiaomi/mimo-2.
     codex = _actor("codex", OrchestratorRole.CODEX)
     glm = _actor("glm-5.2", OrchestratorRole.GLM)
     project = service.init_project(codex, "demo", repo, repo / "docs", "main", {"unit": [sys.executable, "-c", "print('ok')"]})
-    service.register_agent(codex, project["id"], glm.name, OrchestratorRole.GLM, [OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER], mimo_model="xiaomi/glm-5.2")
+    service.register_agent(codex, project["id"], glm.name, OrchestratorRole.GLM, [OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER], mimo_model="zai-coding-plan/glm-5.2")
     service.register_agent(codex, project["id"], "mimo-2.5", OrchestratorRole.WORKER_JUNIOR, [OrchestratorRole.WORKER_JUNIOR], mimo_model=junior_model)
-    service.register_agent(codex, project["id"], "mimo-2.5-pro", OrchestratorRole.WORKER_PRO, [OrchestratorRole.WORKER_PRO], mimo_model="xiaomi/mimo-2.5-pro")
+    service.register_agent(codex, project["id"], "mimo-2.5-pro", OrchestratorRole.WORKER_PRO, [OrchestratorRole.WORKER_PRO], mimo_model="xiaomi/mimo-v2.5-pro")
     task = service.create_codex_task(codex, project["id"], "Mimo bridge", "dispatch isolated work", "ledger owns state", ["test-first"], ["automatic acceptance"], ["audited session"], ["src/**"], ["tests/**"])
     service.plan_task(glm, task["id"])
     service.register_verification_plan(glm, task["id"], "deterministic", ["unit"])
@@ -146,9 +146,9 @@ def test_mimo_dispatch_creates_isolated_worktree_and_audited_briefing(tmp_path: 
     assert workspace != Path(service.get_project(task["project_id"])["repo_path"])
     assert (workspace / "src" / "worker.py").read_text(encoding="utf-8") == "value = 1\n"
     assert "Work-package id" in briefing.read_text(encoding="utf-8")
-    assert runner.launches[0]["model"] == "xiaomi/mimo-2.5"
-    assert runner.launches[0]["agent"] == "mimo-2.5"
-    assert session["mimo_agent"] == "mimo-2.5"
+    assert runner.launches[0]["model"] == "xiaomi/mimo-v2.5"
+    assert runner.launches[0]["agent"] == "build"
+    assert session["mimo_agent"] == "build"
     assert session["handoff_event"]["type"] == "WORKER_STARTED"
     assert any(event["event_type"] == "mimo.session_launched" for event in service.list_audit(task_id=task["id"]))
 
@@ -158,14 +158,9 @@ def test_mimo_dispatch_creates_isolated_worktree_and_audited_briefing(tmp_path: 
     assert observed["exit_code"] == 0
 
 
-def test_mimo_dispatch_rejects_missing_registered_model_before_worktree_creation(tmp_path: Path) -> None:
-    service, runner, glm, _task, package = _ready_service(tmp_path, junior_model=None)
-
-    with pytest.raises(OrchestratorError, match="no configured Mimo model"):
-        service.launch_mimo_session(glm, package["id"], MimoLaunchMode.HEADLESS)
-
-    assert not runner.launches
-    assert not (tmp_path / "state" / "worktrees").exists()
+def test_work_package_creation_rejects_missing_registered_model_before_dispatch(tmp_path: Path) -> None:
+    with pytest.raises(OrchestratorError, match="explicit provider/model"):
+        _ready_service(tmp_path, junior_model=None)
 
 
 def test_detached_tui_session_is_not_cancellable_by_the_service(tmp_path: Path) -> None:
@@ -227,8 +222,8 @@ def test_mimo_pro_repair_starts_from_the_rejected_worker_commit(tmp_path: Path) 
     assert "Required repair fixes: ['repair it']" in briefing
 
 
-def test_mimo_repair_uses_free_junior_when_pro_is_unavailable(tmp_path: Path) -> None:
-    service, runner, glm, task, package = _ready_service(tmp_path, junior_model="mimo-auto-junior")
+def test_mimo_repair_uses_paid_junior_when_pro_is_unavailable(tmp_path: Path) -> None:
+    service, runner, glm, task, package = _ready_service(tmp_path, junior_model="xiaomi/mimo-v2.5")
     codex = _actor("codex", OrchestratorRole.CODEX)
     service.set_agent_availability(codex, task["project_id"], "mimo-2.5-pro", "unavailable")
     first = service.launch_mimo_session(glm, package["id"], MimoLaunchMode.HEADLESS)
@@ -266,16 +261,17 @@ def test_mimo_repair_uses_free_junior_when_pro_is_unavailable(tmp_path: Path) ->
 
     assert repair["assigned_agent"] == "mimo-2.5"
     assert repair["assigned_role"] == OrchestratorRole.WORKER_JUNIOR.value
-    assert repair["mimo_model"] == "mimo-auto-junior"
-    assert repair["mimo_agent"] == "mimo-2.5"
+    assert repair["mimo_model"] == "xiaomi/mimo-v2.5"
+    assert repair["mimo_agent"] == "build"
     assert repair["lifecycle_state"] == MimoSessionStatus.TUI_DETACHED.value
-    assert runner.launches[-1]["model"] == "mimo-auto-junior"
-    assert runner.launches[-1]["agent"] == "mimo-2.5"
+    assert runner.launches[-1]["model"] == "xiaomi/mimo-v2.5"
+    assert runner.launches[-1]["agent"] == "build"
     assert _git(Path(repair["workspace_path"]), "rev-parse", "HEAD") == rejected_head
     briefing = Path(repair["briefing_path"]).read_text(encoding="utf-8")
     assert "Registered agent: mimo-2.5" in briefing
     assert "Bound role required: worker_junior" in briefing
-    assert "Selected MiMoCode agent: mimo-2.5" in briefing
+    assert "Selected provider/model backend: xiaomi/mimo-v2.5" in briefing
+    assert "Selected MiMoCode TUI agent: build" in briefing
     assert f"Repair source commit: {rejected_head}" in briefing
     assert "Latest rejection findings: ['needs repair']" in briefing
     assert "Required repair fixes: ['repair it']" in briefing
@@ -285,7 +281,7 @@ def test_mimo_repair_uses_free_junior_when_pro_is_unavailable(tmp_path: Path) ->
 
 
 def test_mimo_repair_tui_launch_ignores_superseded_detached_tui(tmp_path: Path) -> None:
-    service, runner, glm, task, package = _ready_service(tmp_path, junior_model="mimo-auto-junior")
+    service, runner, glm, task, package = _ready_service(tmp_path, junior_model="xiaomi/mimo-v2.5")
     codex = _actor("codex", OrchestratorRole.CODEX)
     service.set_agent_availability(codex, task["project_id"], "mimo-2.5-pro", "unavailable")
     first = service.launch_mimo_session(glm, package["id"], MimoLaunchMode.TUI)
@@ -320,8 +316,8 @@ def test_mimo_repair_tui_launch_ignores_superseded_detached_tui(tmp_path: Path) 
     assert repair["id"] != first["id"]
     assert repair["assigned_agent"] == "mimo-2.5"
     assert repair["assigned_role"] == OrchestratorRole.WORKER_JUNIOR.value
-    assert repair["mimo_model"] == "mimo-auto-junior"
-    assert repair["mimo_agent"] == "mimo-2.5"
+    assert repair["mimo_model"] == "xiaomi/mimo-v2.5"
+    assert repair["mimo_agent"] == "build"
     assert repair["lifecycle_state"] == MimoSessionStatus.TUI_DETACHED.value
     assert len(runner.launches) == 2
     assert _git(Path(repair["workspace_path"]), "rev-parse", "HEAD") == rejected_head
@@ -344,7 +340,7 @@ def test_controller_can_recover_orphaned_prepared_session_without_accepting_work
                 glm.name,
                 "mimo-2.5",
                 OrchestratorRole.WORKER_JUNIOR.value,
-                "xiaomi/mimo-2.5",
+                "xiaomi/mimo-v2.5",
                 MimoLaunchMode.HEADLESS.value,
                 MimoSessionStatus.PREPARED.value,
                 "2026-06-20T00:00:00+00:00",
@@ -374,7 +370,7 @@ def test_controller_can_recover_an_absent_headless_process_without_accepting_wor
                 glm.name,
                 "mimo-2.5",
                 OrchestratorRole.WORKER_JUNIOR.value,
-                "xiaomi/mimo-2.5",
+                "xiaomi/mimo-v2.5",
                 MimoLaunchMode.HEADLESS.value,
                 MimoSessionStatus.RUNNING.value,
                 999_999,
@@ -401,20 +397,22 @@ def test_mimo_profile_binds_each_registered_agent_identity(tmp_path: Path) -> No
     assert profile["command"] == sys.executable
     assert profile["env"]["GRACE_ORCHESTRATOR_ACTOR_NAME"] == "mimo-2.5"
     assert profile["env"]["GRACE_ORCHESTRATOR_ACTOR_ROLE"] == OrchestratorRole.WORKER_JUNIOR.value
-    assert profile["mimo_agent"] == "mimo-2.5"
+    assert profile["mimo_agent"] == "build"
+    assert profile["mimo_model"] == "xiaomi/mimo-v2.5"
+    assert profile["backend_family"] == "mimo"
 
 
 def test_mimo_runner_builds_shell_free_headless_argv(tmp_path: Path) -> None:
     runner = MimoRunner(tmp_path, command="mimo")
     argv = runner.build_command(
         mode=MimoLaunchMode.HEADLESS,
-        model="xiaomi/mimo-2.5",
+        model="xiaomi/mimo-v2.5",
         workspace_path=tmp_path / "workspace",
         briefing_path=tmp_path / "briefing.md",
         session_id=7,
     )
 
-    assert argv[1:4] == ["run", "--model", "xiaomi/mimo-2.5"]
+    assert argv[1:4] == ["run", "--model", "xiaomi/mimo-v2.5"]
     if os_name == "nt":
         assert argv[0].lower().endswith("mimo.exe")
     assert "--trust" not in argv
@@ -426,43 +424,39 @@ def test_mimo_runner_builds_trusted_tui_argv(tmp_path: Path) -> None:
     runner = MimoRunner(tmp_path, command="mimo")
     argv = runner.build_command(
         mode=MimoLaunchMode.TUI,
-        model="xiaomi/mimo-2.5",
+        model="xiaomi/mimo-v2.5",
         workspace_path=tmp_path / "workspace",
         briefing_path=tmp_path / "briefing.md",
         session_id=7,
     )
 
-    assert argv[1:4] == ["--model", "xiaomi/mimo-2.5", "--trust"]
+    assert argv[1:4] == ["--model", "xiaomi/mimo-v2.5", "--trust"]
     assert "--prompt" in argv
     assert "--dangerously-skip-permissions" not in argv
 
 
-def test_mimo_runner_uses_cli_default_for_auto_junior_tui(tmp_path: Path) -> None:
+def test_mimo_runner_rejects_legacy_implicit_auto_junior_tui(tmp_path: Path) -> None:
+    runner = MimoRunner(tmp_path, command="mimo")
+
+    with pytest.raises(OrchestratorError, match="legacy implicit aliases are blocked"):
+        runner.build_command(
+            mode=MimoLaunchMode.TUI,
+            model="mimo-auto-junior",
+            workspace_path=tmp_path / "workspace",
+            briefing_path=tmp_path / "briefing.md",
+            session_id=7,
+        )
+
+
+def test_mimo_runner_pins_mimocode_agent_with_explicit_model_for_tui(tmp_path: Path) -> None:
     runner = MimoRunner(tmp_path, command="mimo")
     argv = runner.build_command(
         mode=MimoLaunchMode.TUI,
-        model="mimo-auto-junior",
+        model="xiaomi/mimo-v2.5",
+        agent="build",
         workspace_path=tmp_path / "workspace",
         briefing_path=tmp_path / "briefing.md",
         session_id=7,
     )
 
-    assert argv[1:3] == ["--trust", "--prompt"]
-    assert "--model" not in argv
-    assert "xiaomi/mimo-v2.5" not in argv
-    assert "--dangerously-skip-permissions" not in argv
-
-
-def test_mimo_runner_pins_cli_agent_without_model_for_auto_junior_tui(tmp_path: Path) -> None:
-    runner = MimoRunner(tmp_path, command="mimo")
-    argv = runner.build_command(
-        mode=MimoLaunchMode.TUI,
-        model="mimo-auto-junior",
-        agent="mimo-auto-junior",
-        workspace_path=tmp_path / "workspace",
-        briefing_path=tmp_path / "briefing.md",
-        session_id=7,
-    )
-
-    assert argv[1:5] == ["--agent", "mimo-auto-junior", "--trust", "--prompt"]
-    assert "--model" not in argv
+    assert argv[1:6] == ["--agent", "build", "--model", "xiaomi/mimo-v2.5", "--trust"]

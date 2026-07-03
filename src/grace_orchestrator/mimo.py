@@ -30,7 +30,7 @@ from shutil import which
 import subprocess
 from typing import Any, Mapping
 
-from .models import MimoLaunchMode, OrchestratorError
+from .models import MimoLaunchMode, OrchestratorError, OrchestratorRole
 
 logger = logging.getLogger(__name__)
 
@@ -96,8 +96,8 @@ class MimoRunner:
         session_id: int,
     ) -> list[str]:
         # START_CONTRACT: MimoRunner.build_command
-        #   PURPOSE: Build a fixed argv vector for one registered Mimo model and briefing.
-        #   INPUTS: { mode, model, workspace_path, briefing_path, session_id }
+        #   PURPOSE: Build a fixed argv vector for one registered provider/model backend and briefing.
+        #   INPUTS: { mode, model, agent, workspace_path, briefing_path, session_id }
         #   OUTPUTS: { list[str] - shell-free executable argv }
         #   SIDE_EFFECTS: none.
         #   LINKS: M-ORCH-MIMO-EXECUTOR, V-M-ORCH-MIMO-EXECUTOR
@@ -107,29 +107,16 @@ class MimoRunner:
             "Use the configured GRACE Orchestrator MCP server, confirm its bound identity, "
             "and follow the briefing exactly. Do not claim acceptance in prose."
         )
-        use_cli_default_model = is_cli_default_mimo_model(model)
+        backend_model = normalized_explicit_backend_model(model)
         agent_binding = agent.strip() if isinstance(agent, str) and agent.strip() else None
         agent_args = ["--agent", agent_binding] if agent_binding else []
         if mode == MimoLaunchMode.HEADLESS:
-            if use_cli_default_model:
-                return [
-                    self.command,
-                    "run",
-                    *agent_args,
-                    "--dir",
-                    str(workspace_path),
-                    "--file",
-                    str(briefing_path),
-                    "--title",
-                    f"grace-package-{session_id}",
-                    prompt,
-                ]
             return [
                 self.command,
                 "run",
                 *agent_args,
                 "--model",
-                model,
+                backend_model,
                 "--dir",
                 str(workspace_path),
                 "--file",
@@ -139,9 +126,7 @@ class MimoRunner:
                 prompt,
             ]
         if mode == MimoLaunchMode.TUI:
-            if use_cli_default_model:
-                return [self.command, *agent_args, "--trust", "--prompt", prompt]
-            return [self.command, *agent_args, "--model", model, "--trust", "--prompt", prompt]
+            return [self.command, *agent_args, "--model", backend_model, "--trust", "--prompt", prompt]
         raise OrchestratorError(f"Unsupported Mimo launch mode: {mode}")
 
     def launch(
@@ -226,13 +211,60 @@ class MimoRunner:
         return exit_code
 
 
-def is_cli_default_mimo_model(model: str) -> bool:
-    return model.strip().lower() in {
+LEGACY_IMPLICIT_MIMO_ALIASES = frozenset(
+    {
         "auto",
         "auto-junior",
         "default",
         "mimo-auto-junior",
     }
+)
+
+
+def normalized_explicit_backend_model(model: str) -> str:
+    normalized = model.strip()
+    lowered = normalized.lower()
+    if not normalized:
+        raise OrchestratorError("Mimo backend model must be a non-empty explicit provider/model identifier")
+    if lowered in LEGACY_IMPLICIT_MIMO_ALIASES or "/" not in normalized:
+        raise OrchestratorError(
+            "Mimo backend model must be explicit provider/model, for example "
+            "xiaomi/mimo-v2.5 or zai-coding-plan/glm-5.2; legacy implicit aliases are blocked"
+        )
+    return normalized
+
+
+def backend_family(model: str) -> str:
+    normalized = normalized_explicit_backend_model(model).lower()
+    if normalized.startswith("zai-coding-plan/") and "glm" in normalized:
+        return "glm"
+    if normalized.startswith("xiaomi/mimo-") or normalized.startswith("mimo/mimo-"):
+        return "mimo"
+    return "unknown"
+
+
+def validate_backend_for_role(model: str, role: OrchestratorRole) -> None:
+    family = backend_family(model)
+    if role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+        if family != "mimo":
+            raise OrchestratorError(
+                f"{role.value} agents must use a Xiaomi/MiMo worker backend; got {model!r}"
+            )
+        return
+    if role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+        if family != "glm":
+            raise OrchestratorError(
+                f"{role.value} agents must use the Z.ai Coding Plan GLM backend; got {model!r}"
+            )
+        return
+    if family == "unknown":
+        raise OrchestratorError(f"Unsupported Mimo backend model: {model!r}")
+
+
+def default_mimocode_agent_for_role(role: str) -> str:
+    if role in {OrchestratorRole.GLM.value, OrchestratorRole.TEST_OWNER.value}:
+        return "build"
+    return "build"
 
 
 def render_work_package_briefing(
@@ -246,7 +278,9 @@ def render_work_package_briefing(
     """Render a non-authoritative handoff projection for one Mimo worker session."""
 
     operation_id = package.get("operation_id") or f"task-{task['id']}"
-    mimo_agent = agent.get("mimo_agent") or agent["name"]
+    mimo_agent = agent.get("mimo_agent") or default_mimocode_agent_for_role(str(agent["primary_role"]))
+    backend_model = normalized_explicit_backend_model(str(agent["mimo_model"]))
+    family = backend_family(backend_model)
     return "\n".join(
         [
             "# GRACE Mimo Work-Package Briefing",
@@ -254,8 +288,9 @@ def render_work_package_briefing(
             f"Session: {session_id}",
             f"Registered agent: {agent['name']}",
             f"Bound role required: {agent['primary_role']}",
-            f"Selected Mimo model: {agent['mimo_model']}",
-            f"Selected MiMoCode agent: {mimo_agent}",
+            f"Selected provider/model backend: {backend_model}",
+            f"Backend family: {family}",
+            f"Selected MiMoCode TUI agent: {mimo_agent}",
             f"Isolated workspace: {workspace_path}",
             "",
             "## Operation authority",
@@ -270,7 +305,7 @@ def render_work_package_briefing(
             f"Operation isolation: {package.get('operation_isolation') or {}}",
             "",
             "## Authority",
-            "Use the Mimo MCP connection configured for this exact registered agent. First call `orchestrator.whoami`; if its identity or role differs from this briefing, stop and report a blocked session. MCP authority is process-bound, never selected in a tool argument.",
+            "Use the Mimo MCP connection configured for this exact registered GRACE agent. First call `orchestrator.whoami`; if its identity or role differs from this briefing, stop and report a blocked session. MCP authority is process-bound and separate from the MiMoCode TUI agent/profile.",
             "",
             "## Parent task",
             f"Title: {task['title']}",

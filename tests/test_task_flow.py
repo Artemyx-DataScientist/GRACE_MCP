@@ -76,6 +76,7 @@ def test_codex_fallback_can_drive_a_complete_local_acceptance_flow(tmp_path: Pat
         primary_role=OrchestratorRole.GLM,
         capabilities=[OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER],
         availability="unavailable",
+        mimo_model="zai-coding-plan/glm-5.2",
     )
     service.register_agent(
         codex,
@@ -83,6 +84,7 @@ def test_codex_fallback_can_drive_a_complete_local_acceptance_flow(tmp_path: Pat
         name=junior.name,
         primary_role=OrchestratorRole.WORKER_JUNIOR,
         capabilities=[OrchestratorRole.WORKER_JUNIOR],
+        mimo_model="xiaomi/mimo-v2.5",
     )
     service.register_agent(
         codex,
@@ -90,6 +92,7 @@ def test_codex_fallback_can_drive_a_complete_local_acceptance_flow(tmp_path: Pat
         name=pro.name,
         primary_role=OrchestratorRole.WORKER_PRO,
         capabilities=[OrchestratorRole.WORKER_PRO],
+        mimo_model="xiaomi/mimo-v2.5-pro",
     )
     task = service.create_codex_task(
         codex,
@@ -259,6 +262,7 @@ def test_codex_controller_repair_can_replace_unavailable_pro_submission(tmp_path
         name=junior.name,
         primary_role=OrchestratorRole.WORKER_JUNIOR,
         capabilities=[OrchestratorRole.WORKER_JUNIOR],
+        mimo_model="xiaomi/mimo-v2.5",
     )
     service.register_agent(
         codex,
@@ -266,6 +270,7 @@ def test_codex_controller_repair_can_replace_unavailable_pro_submission(tmp_path
         name=pro.name,
         primary_role=OrchestratorRole.WORKER_PRO,
         capabilities=[OrchestratorRole.WORKER_PRO],
+        mimo_model="xiaomi/mimo-v2.5-pro",
         availability="unavailable",
     )
     task = service.create_codex_task(
@@ -382,6 +387,71 @@ def test_codex_controller_repair_can_replace_unavailable_pro_submission(tmp_path
     assert service.get_task(task["id"])["status"] == TaskStatus.GLM_ACCEPTED.value
 
 
+def test_cancelled_superseded_package_does_not_block_accepted_sibling(tmp_path: Path) -> None:
+    service = OrchestratorService(tmp_path / "ledger.sqlite3")
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    glm = _actor("glm-5.2", OrchestratorRole.GLM)
+    junior = _actor("mimo-2.5", OrchestratorRole.WORKER_JUNIOR)
+    pro = _actor("mimo-2.5-pro", OrchestratorRole.WORKER_PRO)
+    project = service.init_project(codex, "demo", tmp_path, tmp_path / "grace", "main", {"unit": ["python", "-m", "pytest"]})
+    service.register_agent(codex, project["id"], "glm-5.2", OrchestratorRole.GLM, [OrchestratorRole.GLM], mimo_model="zai-coding-plan/glm-5.2")
+    service.register_agent(codex, project["id"], junior.name, OrchestratorRole.WORKER_JUNIOR, [OrchestratorRole.WORKER_JUNIOR], mimo_model="xiaomi/mimo-v2.5")
+    service.register_agent(codex, project["id"], pro.name, OrchestratorRole.WORKER_PRO, [OrchestratorRole.WORKER_PRO], mimo_model="xiaomi/mimo-v2.5-pro")
+    task = service.create_codex_task(codex, project["id"], "superseded package", "replace stale v1", "ledger owns package lifecycle", [], [], ["v2 accepted"], ["src/**"], ["tests/**"])
+    service.plan_task(glm, task["id"])
+    service.register_verification_plan(glm, task["id"], test_strategy="unit", test_commands=["unit"])
+    stale = service.create_work_package(
+        glm,
+        task["id"],
+        title="v1 stale",
+        objective="old packet",
+        allowed_files=["src/a.py"],
+        forbidden_files=["tests/**"],
+        assigned_junior_agent=junior.name,
+        assigned_pro_agent=pro.name,
+        base_commit="a" * 40,
+        **{**packet_kwargs(), "cache_anchor": "stale"},
+    )
+    replacement = service.create_work_package(
+        glm,
+        task["id"],
+        title="v2 replacement",
+        objective="replacement packet",
+        allowed_files=["src/b.py"],
+        forbidden_files=["tests/**"],
+        assigned_junior_agent=junior.name,
+        assigned_pro_agent=pro.name,
+        base_commit="a" * 40,
+        **{**packet_kwargs(), "cache_anchor": "replacement"},
+    )
+    service.assign_work_package(glm, stale["id"])
+    service.assign_work_package(glm, replacement["id"])
+    service.claim_work_package(junior, replacement["id"])
+    service.submit_package(
+        junior,
+        replacement["id"],
+        summary="implemented replacement",
+        evidence=SubmissionEvidence(
+            base_commit="a" * 40,
+            head_commit="b" * 40,
+            diff="diff --git a/src/b.py b/src/b.py",
+            diff_hash="b" * 64,
+            files_changed=["src/b.py"],
+        ),
+        tests_run=[{"command_key": "unit", "exit_code": 0}],
+        risk_notes="none",
+        worker_report=worker_report(task_id=task["id"], package_id=replacement["id"], files_changed=["src/b.py"]),
+    )
+    service.review_package(glm, replacement["id"], decision="accepted", findings=[], required_fixes=[])
+    assert service.acceptance_review_gate(codex, task["id"])["status"] == "blocked"
+
+    cancelled = service.cancel_work_package(glm, stale["id"], "superseded by replacement package")
+
+    assert cancelled["status"] == WorkPackageStatus.CANCELLED.value
+    assert service.get_task(task["id"])["status"] == TaskStatus.GLM_ACCEPTED.value
+    assert service.acceptance_review_gate(codex, task["id"])["status"] == "pass"
+
+
 def test_controller_owned_task_completion_can_reach_final_review_without_package(tmp_path: Path) -> None:
     service = OrchestratorService(tmp_path / "ledger.sqlite3")
     codex = _actor("codex", OrchestratorRole.CODEX)
@@ -450,8 +520,8 @@ def test_controller_owned_task_completion_cannot_bypass_existing_package(tmp_pat
     codex = _actor("codex", OrchestratorRole.CODEX)
     glm = _actor("glm", OrchestratorRole.GLM)
     project = service.init_project(codex, "demo", tmp_path, tmp_path / "grace", "main", {"unit": ["python", "-m", "pytest"]})
-    service.register_agent(codex, project["id"], "junior", OrchestratorRole.WORKER_JUNIOR, [OrchestratorRole.WORKER_JUNIOR])
-    service.register_agent(codex, project["id"], "pro", OrchestratorRole.WORKER_PRO, [OrchestratorRole.WORKER_PRO])
+    service.register_agent(codex, project["id"], "junior", OrchestratorRole.WORKER_JUNIOR, [OrchestratorRole.WORKER_JUNIOR], mimo_model="xiaomi/mimo-v2.5")
+    service.register_agent(codex, project["id"], "pro", OrchestratorRole.WORKER_PRO, [OrchestratorRole.WORKER_PRO], mimo_model="xiaomi/mimo-v2.5-pro")
     task = service.create_codex_task(codex, project["id"], "t", "o", "i", [], [], [], ["src/**"], [])
     service.plan_task(glm, task["id"])
     service.register_verification_plan(glm, task["id"], "deterministic", ["unit"])
@@ -501,6 +571,81 @@ def test_junior_cannot_be_registered_as_fallback_capable(tmp_path: Path) -> None
         )
 
 
+def test_pro_worker_can_plan_when_explicitly_delegated_for_glm_substitution(tmp_path: Path) -> None:
+    service = OrchestratorService(tmp_path / "ledger.sqlite3")
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    pro = _actor("mimo-2.5-pro", OrchestratorRole.WORKER_PRO)
+    project = service.init_project(
+        codex,
+        "demo",
+        tmp_path,
+        tmp_path / "grace",
+        "main",
+        {"unit": ["python", "-m", "pytest"]},
+    )
+    service.register_agent(
+        codex,
+        project["id"],
+        "glm-5.2",
+        OrchestratorRole.GLM,
+        [OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER],
+        availability="unavailable",
+        mimo_model="zai-coding-plan/glm-5.2",
+    )
+    service.register_agent(
+        codex,
+        project["id"],
+        pro.name,
+        OrchestratorRole.WORKER_PRO,
+        [OrchestratorRole.WORKER_PRO, OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER],
+        mimo_model="xiaomi/mimo-v2.5-pro",
+    )
+    task = service.create_codex_task(
+        codex,
+        project["id"],
+        "pro substitution",
+        "allow Pro to plan only under explicit GLM substitution",
+        "delegation ledger owns authority",
+        ["GLM unavailable"],
+        ["silent role promotion"],
+        ["delegated plan accepted"],
+        ["src/**"],
+        [],
+    )
+    service.delegate_role(
+        codex,
+        project["id"],
+        task["id"],
+        unavailable_role=OrchestratorRole.GLM,
+        substitute_actor=pro.name,
+        delegated_role=OrchestratorRole.GLM,
+        reason="GLM unavailable; paid MiMo Pro is explicit substitute planner",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    service.delegate_role(
+        codex,
+        project["id"],
+        task["id"],
+        unavailable_role=OrchestratorRole.TEST_OWNER,
+        substitute_actor=pro.name,
+        delegated_role=OrchestratorRole.TEST_OWNER,
+        reason="GLM unavailable; paid MiMo Pro is explicit substitute test owner",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+    planned = service.plan_task(pro, task["id"])
+    service.register_verification_plan(
+        pro,
+        task["id"],
+        test_strategy="delegated Pro substitution",
+        test_commands=["unit"],
+    )
+
+    assert planned["status"] == TaskStatus.GLM_GRACE_PLANNED.value
+    assert service.get_task(task["id"])["status"] == TaskStatus.GLM_TESTS_PREPARED.value
+    assert any(event["event_type"] == "role.delegated" for event in service.list_audit())
+
+
 def test_final_review_before_package_acceptance_is_rejected(tmp_path: Path) -> None:
     service = OrchestratorService(tmp_path / "ledger.sqlite3")
     codex = _actor("codex", OrchestratorRole.CODEX)
@@ -516,8 +661,8 @@ def test_work_package_creation_requires_passing_contract_discovery(tmp_path: Pat
     glm = _actor("glm", OrchestratorRole.GLM)
     project = service.init_project(codex, "demo", tmp_path, tmp_path / "grace", "main", {"unit": ["python", "-m", "pytest"]})
     service.register_agent(codex, project["id"], glm.name, OrchestratorRole.GLM, [OrchestratorRole.GLM])
-    service.register_agent(codex, project["id"], "junior", OrchestratorRole.WORKER_JUNIOR, [OrchestratorRole.WORKER_JUNIOR])
-    service.register_agent(codex, project["id"], "pro", OrchestratorRole.WORKER_PRO, [OrchestratorRole.WORKER_PRO])
+    service.register_agent(codex, project["id"], "junior", OrchestratorRole.WORKER_JUNIOR, [OrchestratorRole.WORKER_JUNIOR], mimo_model="xiaomi/mimo-v2.5")
+    service.register_agent(codex, project["id"], "pro", OrchestratorRole.WORKER_PRO, [OrchestratorRole.WORKER_PRO], mimo_model="xiaomi/mimo-v2.5-pro")
     task = service.create_codex_task(codex, project["id"], "t", "o", "i", [], [], [], ["src/**"], ["tests/**"])
     service.plan_task(glm, task["id"])
     service.register_verification_plan(glm, task["id"], "deterministic", ["unit"])
@@ -551,8 +696,8 @@ def test_submission_requires_worker_report_validation(tmp_path: Path) -> None:
     junior = _actor("junior", OrchestratorRole.WORKER_JUNIOR)
     project = service.init_project(codex, "demo", tmp_path, tmp_path / "grace", "main", {"unit": ["python", "-m", "pytest"]})
     service.register_agent(codex, project["id"], glm.name, OrchestratorRole.GLM, [OrchestratorRole.GLM])
-    service.register_agent(codex, project["id"], junior.name, OrchestratorRole.WORKER_JUNIOR, [OrchestratorRole.WORKER_JUNIOR])
-    service.register_agent(codex, project["id"], "pro", OrchestratorRole.WORKER_PRO, [OrchestratorRole.WORKER_PRO])
+    service.register_agent(codex, project["id"], junior.name, OrchestratorRole.WORKER_JUNIOR, [OrchestratorRole.WORKER_JUNIOR], mimo_model="xiaomi/mimo-v2.5")
+    service.register_agent(codex, project["id"], "pro", OrchestratorRole.WORKER_PRO, [OrchestratorRole.WORKER_PRO], mimo_model="xiaomi/mimo-v2.5-pro")
     task = service.create_codex_task(codex, project["id"], "t", "o", "i", [], [], [], ["src/**"], ["tests/**"])
     service.plan_task(glm, task["id"])
     service.register_verification_plan(glm, task["id"], "deterministic", ["unit"])

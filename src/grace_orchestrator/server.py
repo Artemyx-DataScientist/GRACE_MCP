@@ -68,6 +68,7 @@ REQUIRED_TOOLS = {
     "workpackage.create",
     "workpackage.assign",
     "workpackage.claim",
+    "workpackage.cancel",
     "submission.create",
     "submission.controller_repair",
     "submission.controller_task_completion",
@@ -412,6 +413,10 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     @mcp.tool("workpackage.claim", description="Claim an assigned junior or rejected Pro repair package.")
     def claim_work_package(work_package_id: int) -> dict[str, Any]:
         return _plain(service.claim_work_package(actor, work_package_id))
+
+    @mcp.tool("workpackage.cancel", description="Cancel a stale or superseded package without treating it as accepted work.")
+    def cancel_work_package(work_package_id: int, reason: str) -> dict[str, Any]:
+        return _plain(service.cancel_work_package(actor, work_package_id, reason))
 
     @mcp.tool("mimo.connection_profile", description="Return a role-bound STDIO MCP profile to add in Mimo for one registered agent.")
     def mimo_connection_profile(project_id: int, agent_name: str) -> dict[str, Any]:

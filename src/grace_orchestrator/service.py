@@ -593,8 +593,8 @@ class OrchestratorService:
             )
             project_id = int(cursor.lastrowid)
             conn.execute(
-                """INSERT INTO agents (project_id, name, primary_role, capabilities_json, mimo_model, availability, updated_at)
-                   VALUES (?, ?, ?, ?, NULL, 'available', ?)""",
+                """INSERT INTO agents (project_id, name, primary_role, capabilities_json, mimo_model, mimo_agent, availability, updated_at)
+                   VALUES (?, ?, ?, ?, NULL, NULL, 'available', ?)""",
                 (project_id, actor.name, actor.primary_role.value, _json([actor.primary_role.value]), timestamp),
             )
             self._audit(conn, actor, OrchestratorRole.CODEX, "project.initialized", "project", project_id, {"name": name})
@@ -610,6 +610,7 @@ class OrchestratorService:
         capabilities: Sequence[OrchestratorRole],
         availability: str = "available",
         mimo_model: str | None = None,
+        mimo_agent: str | None = None,
     ) -> dict[str, Any]:
         # START_CONTRACT: OrchestratorService.register_agent
         #   PURPOSE: Register a model's availability and eligible role capabilities.
@@ -625,24 +626,51 @@ class OrchestratorService:
         normalized_model = mimo_model.strip() if mimo_model is not None else None
         if mimo_model is not None and not normalized_model:
             raise OrchestratorError("Mimo model must be a non-empty provider/model identifier when supplied")
+        normalized_mimo_agent = mimo_agent.strip() if mimo_agent is not None else None
+        if mimo_agent is not None and not normalized_mimo_agent:
+            raise OrchestratorError("MiMoCode agent binding must be non-empty when supplied")
         capability_values = sorted({role.value for role in capabilities} | {primary_role.value})
         if primary_role == OrchestratorRole.WORKER_JUNIOR and capability_values != [OrchestratorRole.WORKER_JUNIOR.value]:
             raise OrchestratorError("Junior agents cannot be registered with fallback role capabilities")
         timestamp = _now()
         with self.store.transaction() as conn:
             conn.execute(
-                """INSERT INTO agents (project_id, name, primary_role, capabilities_json, mimo_model, availability, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO agents (project_id, name, primary_role, capabilities_json, mimo_model, mimo_agent, availability, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(project_id, name) DO UPDATE SET
                      primary_role = excluded.primary_role,
                      capabilities_json = excluded.capabilities_json,
                      mimo_model = excluded.mimo_model,
+                     mimo_agent = excluded.mimo_agent,
                      availability = excluded.availability,
                      updated_at = excluded.updated_at""",
-                (project_id, name, primary_role.value, _json(capability_values), normalized_model, availability, timestamp),
+                (
+                    project_id,
+                    name,
+                    primary_role.value,
+                    _json(capability_values),
+                    normalized_model,
+                    normalized_mimo_agent,
+                    availability,
+                    timestamp,
+                ),
             )
             agent_id = int(conn.execute("SELECT id FROM agents WHERE project_id = ? AND name = ?", (project_id, name)).fetchone()[0])
-            self._audit(conn, actor, effective, "agent.registered", "agent", agent_id, {"name": name, "availability": availability, "capabilities": capability_values, "mimo_model": normalized_model})
+            self._audit(
+                conn,
+                actor,
+                effective,
+                "agent.registered",
+                "agent",
+                agent_id,
+                {
+                    "name": name,
+                    "availability": availability,
+                    "capabilities": capability_values,
+                    "mimo_model": normalized_model,
+                    "mimo_agent": normalized_mimo_agent,
+                },
+            )
         return self.get_agent(project_id, name)
 
     def set_allowed_test_commands(
@@ -1121,6 +1149,16 @@ class OrchestratorService:
         cache_anchor: str = "",
         retry_budget: int = 1,
         stop_conditions: Sequence[str] | None = None,
+        operation_id: str = "",
+        authority_mode: str = "codex_led",
+        operation_root: str = "",
+        codex_required: bool | None = None,
+        codex_instance_id: str = "",
+        glm_instance_id: str = "",
+        branch_worktree: str = "",
+        glm_scan_plan_report: Mapping[str, Any] | None = None,
+        operation_isolation: Mapping[str, Any] | None = None,
+        pro_api_assignment: str = "",
     ) -> dict[str, Any]:
         # START_CONTRACT: OrchestratorService.create_work_package
         #   PURPOSE: Create a GLM package whose scope remains inside parent task scope.
@@ -1171,7 +1209,47 @@ class OrchestratorService:
             }
         )
         inherited_forbidden = list(dict.fromkeys([*_loads(task["forbidden_files_json"]), *forbidden_files]))
+        normalized_authority_mode = authority_mode.strip() or "codex_led"
+        if normalized_authority_mode not in {"codex_led", "glm_direct", "parallel_mixed"}:
+            raise OrchestratorError("authority_mode must be codex_led, glm_direct, or parallel_mixed")
+        normalized_operation_id = operation_id.strip() or f"task-{task_id}"
+        normalized_operation_root = operation_root.strip() or actor.name
+        normalized_codex_required = (
+            bool(codex_required)
+            if codex_required is not None
+            else normalized_authority_mode != "glm_direct"
+        )
+        normalized_codex_instance_id = codex_instance_id.strip() or (
+            "codex" if normalized_codex_required else "not-required"
+        )
+        normalized_glm_instance_id = glm_instance_id.strip() or actor.name
+        normalized_branch_worktree = branch_worktree.strip() or f"{project['repo_path']}@{project['main_branch']}"
+        normalized_scan_plan = dict(
+            glm_scan_plan_report
+            or {
+                "status": "not_supplied",
+                "reason": "legacy caller did not provide GLM scan/plan report",
+            }
+        )
+        normalized_operation_isolation = dict(
+            operation_isolation
+            or {
+                "status": "single_operation_workspace",
+                "branch_worktree": normalized_branch_worktree,
+            }
+        )
+        report_format = list(compact_report_format or [])
+        for required_report_field in ("authority mode", "operation id"):
+            if required_report_field not in report_format:
+                report_format.insert(0, required_report_field)
         packet = {
+            "operation id": normalized_operation_id,
+            "authority mode": normalized_authority_mode,
+            "operation root": normalized_operation_root,
+            "codex required": normalized_codex_required,
+            "codex instance id": normalized_codex_instance_id,
+            "glm instance id": normalized_glm_instance_id,
+            "branch/worktree": normalized_branch_worktree,
             "task id": task_id,
             "module id": module_id,
             "verification id": verification_id,
@@ -1183,18 +1261,21 @@ class OrchestratorService:
             "actual worker identity": assigned_junior_agent,
             "launch mode": MimoLaunchMode.TUI.value,
             "trust flag": "--trust required for generated worker worktrees",
-            "forbidden model flags": "No --model argument and no paid/API MiMo model identifiers.",
+            "forbidden model flags": "mimo-auto-junior must not use --model; Pro/API workers require explicit packet assignment.",
+            "pro/api assignment": pro_api_assignment.strip() or "not assigned for junior package",
             "claim identity": assigned_junior_agent,
+            "glm scan/plan report": normalized_scan_plan,
             "required contracts read": discovery.get("contracts_read", []),
             "contract discovery report": discovery,
             "test surface": list(test_surface or []),
             "commands allowed": list(commands_allowed or []),
             "rollback boundary": rollback_boundary,
             "session routing": session_route,
+            "operation isolation": normalized_operation_isolation,
             "cache anchor": cache_anchor,
             "retry budget": retry_budget,
             "stop conditions": list(stop_conditions or []),
-            "compact worker report format": list(compact_report_format or []),
+            "compact worker report format": report_format,
         }
         packet_gate = policy_validate_execution_packet(
             packet,
@@ -1207,10 +1288,13 @@ class OrchestratorService:
             cursor = conn.execute(
                 """INSERT INTO work_packages (
                     task_id, title, objective, allowed_files_json, forbidden_files_json,
-                    assigned_junior_agent, assigned_pro_agent, base_commit, contract_discovery_json,
+                    assigned_junior_agent, assigned_pro_agent, operation_id, authority_mode,
+                    operation_root, codex_required, codex_instance_id, glm_instance_id,
+                    branch_worktree, glm_scan_plan_report_json, operation_isolation_json,
+                    pro_api_assignment, base_commit, contract_discovery_json,
                     test_surface_json, rollback_boundary, compact_report_format_json,
                     session_routing_json, cache_anchor, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     task_id,
                     title,
@@ -1219,11 +1303,21 @@ class OrchestratorService:
                     _json(inherited_forbidden),
                     assigned_junior_agent,
                     assigned_pro_agent,
+                    normalized_operation_id,
+                    normalized_authority_mode,
+                    normalized_operation_root,
+                    1 if normalized_codex_required else 0,
+                    normalized_codex_instance_id,
+                    normalized_glm_instance_id,
+                    normalized_branch_worktree,
+                    _json(normalized_scan_plan),
+                    _json(normalized_operation_isolation),
+                    pro_api_assignment.strip(),
                     base_commit,
                     _json(discovery),
                     _json(list(test_surface or [])),
                     rollback_boundary,
-                    _json(list(compact_report_format or [])),
+                    _json(report_format),
                     _json(session_route),
                     cache_anchor,
                     WorkPackageStatus.CREATED.value,
@@ -1911,6 +2005,11 @@ class OrchestratorService:
         project = self._project(project_id)
         self._authorize(actor, OrchestratorRole.CODEX, project_id)
         agent = self.get_agent(project_id, agent_name)
+        mimo_agent = (
+            str(agent["mimo_agent"]).strip()
+            if agent.get("mimo_agent") is not None and str(agent["mimo_agent"]).strip()
+            else agent["name"]
+        )
         package_root = Path(__file__).resolve().parents[2]
         return {
             "name": f"grace-orchestrator-{agent['name']}",
@@ -1926,8 +2025,10 @@ class OrchestratorService:
             },
             "note": (
                 "Add these fields through Mimo's stdio MCP-server dialog for this exact agent. "
-                "Each agent needs its own profile because actor identity is bound at server start."
+                "Each agent needs its own profile because actor identity is bound at server start. "
+                f"Use this MCP profile only from the MiMoCode agent named {mimo_agent!r}."
             ),
+            "mimo_agent": mimo_agent,
             "project_root": project["repo_path"],
         }
 
@@ -1976,6 +2077,11 @@ class OrchestratorService:
             raise OrchestratorError(
                 f"Assigned agent {assigned_agent!r} has no configured Mimo model; register mimo_model first"
             )
+        mimo_agent = (
+            str(agent["mimo_agent"]).strip()
+            if agent.get("mimo_agent") is not None and str(agent["mimo_agent"]).strip()
+            else assigned_agent
+        )
         detached_tui_cutoff = None
         if package_status == WorkPackageStatus.REPAIR_REQUIRED:
             latest_rejection = self.store.fetchone(
@@ -2023,8 +2129,8 @@ class OrchestratorService:
             cursor = conn.execute(
                 """INSERT INTO mimo_sessions (
                     project_id, task_id, work_package_id, requested_by_agent, assigned_agent,
-                    assigned_role, mimo_model, mode, lifecycle_state, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    assigned_role, mimo_model, mimo_agent, mode, lifecycle_state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     project["id"],
                     task["id"],
@@ -2033,6 +2139,7 @@ class OrchestratorService:
                     assigned_agent,
                     required_role.value,
                     model,
+                    mimo_agent,
                     mode.value,
                     MimoSessionStatus.PREPARED.value,
                     _now(),
@@ -2050,6 +2157,7 @@ class OrchestratorService:
                     "work_package_id": package["id"],
                     "assigned_agent": assigned_agent,
                     "assigned_role": required_role.value,
+                    "mimo_agent": mimo_agent,
                     "mode": mode.value,
                     "repair_route": repair_route if package_status == WorkPackageStatus.REPAIR_REQUIRED else None,
                 },
@@ -2089,6 +2197,7 @@ class OrchestratorService:
                 session_id=session_id,
                 mode=mode,
                 model=model,
+                agent=mimo_agent,
                 workspace_path=created_workspace,
                 briefing_path=briefing_path,
             )
@@ -2144,6 +2253,7 @@ class OrchestratorService:
                 {
                     "pid": launch.pid,
                     "mode": mode.value,
+                    "mimo_agent": mimo_agent,
                     "workspace_path": str(created_workspace),
                     "workspace_base_commit": workspace_base_commit,
                 },
@@ -2517,6 +2627,9 @@ class OrchestratorService:
         package["test_surface"] = _loads(package.pop("test_surface_json"))
         package["compact_report_format"] = _loads(package.pop("compact_report_format_json"))
         package["session_routing"] = _loads(package.pop("session_routing_json"))
+        package["glm_scan_plan_report"] = _loads(package.pop("glm_scan_plan_report_json"))
+        package["operation_isolation"] = _loads(package.pop("operation_isolation_json"))
+        package["codex_required"] = bool(package["codex_required"])
         package["worker_pro_available"] = bool(package["worker_pro_available"])
         return package
 

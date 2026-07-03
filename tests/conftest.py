@@ -4,6 +4,8 @@ from typing import Any
 
 
 WORKER_REPORT_FIELDS = [
+    "operation id",
+    "authority mode",
     "task id",
     "module id",
     "files read",
@@ -59,6 +61,15 @@ def packet_kwargs(
         "cache_anchor": f"GRACE:{module_id}:{verification_id}",
         "retry_budget": 1,
         "stop_conditions": ["scope drift", "protected test changes"],
+        "operation_id": "op-test",
+        "authority_mode": "codex_led",
+        "operation_root": "glm-5.2",
+        "codex_required": True,
+        "codex_instance_id": "codex-test",
+        "glm_instance_id": "glm-5.2",
+        "branch_worktree": "test-worktree",
+        "glm_scan_plan_report": {"status": "provided", "architecture_map": "test"},
+        "operation_isolation": {"status": "isolated"},
     }
 
 
@@ -70,6 +81,8 @@ def worker_report(
     module_id: str = "M-ORCH-LEDGER",
 ) -> dict[str, Any]:
     return {
+        "operation_id": "op-test",
+        "authority_mode": "codex_led",
         "task_id": task_id,
         "work_package_id": package_id,
         "module_id": module_id,

@@ -62,6 +62,7 @@ class FakeMimoRunner:
         session_id: int,
         mode: MimoLaunchMode,
         model: str,
+        agent: str | None = None,
         workspace_path: Path,
         briefing_path: Path,
     ) -> MimoLaunchResult:
@@ -70,12 +71,13 @@ class FakeMimoRunner:
                 "session_id": session_id,
                 "mode": mode,
                 "model": model,
+                "agent": agent,
                 "workspace_path": workspace_path,
                 "briefing_path": briefing_path,
             }
         )
         return MimoLaunchResult(
-            argv=["mimo", "run", "--model", model, "--file", str(briefing_path)],
+            argv=["mimo", "run", "--agent", agent or "", "--model", model, "--file", str(briefing_path)],
             pid=4242,
             stdout_path=None,
             stderr_path=None,
@@ -145,6 +147,8 @@ def test_mimo_dispatch_creates_isolated_worktree_and_audited_briefing(tmp_path: 
     assert (workspace / "src" / "worker.py").read_text(encoding="utf-8") == "value = 1\n"
     assert "Work-package id" in briefing.read_text(encoding="utf-8")
     assert runner.launches[0]["model"] == "xiaomi/mimo-2.5"
+    assert runner.launches[0]["agent"] == "mimo-2.5"
+    assert session["mimo_agent"] == "mimo-2.5"
     assert session["handoff_event"]["type"] == "WORKER_STARTED"
     assert any(event["event_type"] == "mimo.session_launched" for event in service.list_audit(task_id=task["id"]))
 
@@ -263,12 +267,15 @@ def test_mimo_repair_uses_free_junior_when_pro_is_unavailable(tmp_path: Path) ->
     assert repair["assigned_agent"] == "mimo-2.5"
     assert repair["assigned_role"] == OrchestratorRole.WORKER_JUNIOR.value
     assert repair["mimo_model"] == "mimo-auto-junior"
+    assert repair["mimo_agent"] == "mimo-2.5"
     assert repair["lifecycle_state"] == MimoSessionStatus.TUI_DETACHED.value
     assert runner.launches[-1]["model"] == "mimo-auto-junior"
+    assert runner.launches[-1]["agent"] == "mimo-2.5"
     assert _git(Path(repair["workspace_path"]), "rev-parse", "HEAD") == rejected_head
     briefing = Path(repair["briefing_path"]).read_text(encoding="utf-8")
     assert "Registered agent: mimo-2.5" in briefing
     assert "Bound role required: worker_junior" in briefing
+    assert "Selected MiMoCode agent: mimo-2.5" in briefing
     assert f"Repair source commit: {rejected_head}" in briefing
     assert "Latest rejection findings: ['needs repair']" in briefing
     assert "Required repair fixes: ['repair it']" in briefing
@@ -314,6 +321,7 @@ def test_mimo_repair_tui_launch_ignores_superseded_detached_tui(tmp_path: Path) 
     assert repair["assigned_agent"] == "mimo-2.5"
     assert repair["assigned_role"] == OrchestratorRole.WORKER_JUNIOR.value
     assert repair["mimo_model"] == "mimo-auto-junior"
+    assert repair["mimo_agent"] == "mimo-2.5"
     assert repair["lifecycle_state"] == MimoSessionStatus.TUI_DETACHED.value
     assert len(runner.launches) == 2
     assert _git(Path(repair["workspace_path"]), "rev-parse", "HEAD") == rejected_head
@@ -393,6 +401,7 @@ def test_mimo_profile_binds_each_registered_agent_identity(tmp_path: Path) -> No
     assert profile["command"] == sys.executable
     assert profile["env"]["GRACE_ORCHESTRATOR_ACTOR_NAME"] == "mimo-2.5"
     assert profile["env"]["GRACE_ORCHESTRATOR_ACTOR_ROLE"] == OrchestratorRole.WORKER_JUNIOR.value
+    assert profile["mimo_agent"] == "mimo-2.5"
 
 
 def test_mimo_runner_builds_shell_free_headless_argv(tmp_path: Path) -> None:
@@ -442,3 +451,18 @@ def test_mimo_runner_uses_cli_default_for_auto_junior_tui(tmp_path: Path) -> Non
     assert "--model" not in argv
     assert "xiaomi/mimo-v2.5" not in argv
     assert "--dangerously-skip-permissions" not in argv
+
+
+def test_mimo_runner_pins_cli_agent_without_model_for_auto_junior_tui(tmp_path: Path) -> None:
+    runner = MimoRunner(tmp_path, command="mimo")
+    argv = runner.build_command(
+        mode=MimoLaunchMode.TUI,
+        model="mimo-auto-junior",
+        agent="mimo-auto-junior",
+        workspace_path=tmp_path / "workspace",
+        briefing_path=tmp_path / "briefing.md",
+        session_id=7,
+    )
+
+    assert argv[1:5] == ["--agent", "mimo-auto-junior", "--trust", "--prompt"]
+    assert "--model" not in argv

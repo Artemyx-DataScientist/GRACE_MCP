@@ -180,6 +180,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
         capabilities: list[str],
         availability: str = "available",
         mimo_model: str | None = None,
+        mimo_agent: str | None = None,
     ) -> dict[str, Any]:
         try:
             parsed_primary_role = OrchestratorRole(primary_role)
@@ -195,6 +196,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
                 parsed_capabilities,
                 availability,
                 mimo_model,
+                mimo_agent,
             )
         )
 
@@ -357,6 +359,16 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
         cache_anchor: str = "",
         retry_budget: int = 1,
         stop_conditions: list[str] | None = None,
+        operation_id: str = "",
+        authority_mode: str = "codex_led",
+        operation_root: str = "",
+        codex_required: bool | None = None,
+        codex_instance_id: str = "",
+        glm_instance_id: str = "",
+        branch_worktree: str = "",
+        glm_scan_plan_report: dict[str, Any] | None = None,
+        operation_isolation: dict[str, Any] | None = None,
+        pro_api_assignment: str = "",
     ) -> dict[str, Any]:
         return _plain(
             service.create_work_package(
@@ -380,6 +392,16 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
                 cache_anchor,
                 retry_budget,
                 stop_conditions,
+                operation_id,
+                authority_mode,
+                operation_root,
+                codex_required,
+                codex_instance_id,
+                glm_instance_id,
+                branch_worktree,
+                glm_scan_plan_report,
+                operation_isolation,
+                pro_api_assignment,
             )
         )
 

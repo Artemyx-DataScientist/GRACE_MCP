@@ -90,6 +90,7 @@ class MimoRunner:
         *,
         mode: MimoLaunchMode,
         model: str,
+        agent: str | None = None,
         workspace_path: Path,
         briefing_path: Path,
         session_id: int,
@@ -107,11 +108,14 @@ class MimoRunner:
             "and follow the briefing exactly. Do not claim acceptance in prose."
         )
         use_cli_default_model = is_cli_default_mimo_model(model)
+        agent_binding = agent.strip() if isinstance(agent, str) and agent.strip() else None
+        agent_args = ["--agent", agent_binding] if agent_binding else []
         if mode == MimoLaunchMode.HEADLESS:
             if use_cli_default_model:
                 return [
                     self.command,
                     "run",
+                    *agent_args,
                     "--dir",
                     str(workspace_path),
                     "--file",
@@ -123,6 +127,7 @@ class MimoRunner:
             return [
                 self.command,
                 "run",
+                *agent_args,
                 "--model",
                 model,
                 "--dir",
@@ -135,8 +140,8 @@ class MimoRunner:
             ]
         if mode == MimoLaunchMode.TUI:
             if use_cli_default_model:
-                return [self.command, "--trust", "--prompt", prompt]
-            return [self.command, "--model", model, "--trust", "--prompt", prompt]
+                return [self.command, *agent_args, "--trust", "--prompt", prompt]
+            return [self.command, *agent_args, "--model", model, "--trust", "--prompt", prompt]
         raise OrchestratorError(f"Unsupported Mimo launch mode: {mode}")
 
     def launch(
@@ -145,6 +150,7 @@ class MimoRunner:
         session_id: int,
         mode: MimoLaunchMode,
         model: str,
+        agent: str | None = None,
         workspace_path: Path,
         briefing_path: Path,
     ) -> MimoLaunchResult:
@@ -159,6 +165,7 @@ class MimoRunner:
         argv = self.build_command(
             mode=mode,
             model=model,
+            agent=agent,
             workspace_path=workspace_path,
             briefing_path=briefing_path,
             session_id=session_id,
@@ -238,6 +245,8 @@ def render_work_package_briefing(
 ) -> str:
     """Render a non-authoritative handoff projection for one Mimo worker session."""
 
+    operation_id = package.get("operation_id") or f"task-{task['id']}"
+    mimo_agent = agent.get("mimo_agent") or agent["name"]
     return "\n".join(
         [
             "# GRACE Mimo Work-Package Briefing",
@@ -246,7 +255,19 @@ def render_work_package_briefing(
             f"Registered agent: {agent['name']}",
             f"Bound role required: {agent['primary_role']}",
             f"Selected Mimo model: {agent['mimo_model']}",
+            f"Selected MiMoCode agent: {mimo_agent}",
             f"Isolated workspace: {workspace_path}",
+            "",
+            "## Operation authority",
+            f"Operation id: {operation_id}",
+            f"Authority mode: {package.get('authority_mode') or 'codex_led'}",
+            f"Operation root: {package.get('operation_root') or 'unknown'}",
+            f"Codex required: {package.get('codex_required')}",
+            f"Codex instance id: {package.get('codex_instance_id') or 'not-recorded'}",
+            f"GLM instance id: {package.get('glm_instance_id') or 'not-recorded'}",
+            f"Branch/worktree: {package.get('branch_worktree') or workspace_path}",
+            f"GLM scan/plan report: {package.get('glm_scan_plan_report') or {}}",
+            f"Operation isolation: {package.get('operation_isolation') or {}}",
             "",
             "## Authority",
             "Use the Mimo MCP connection configured for this exact registered agent. First call `orchestrator.whoami`; if its identity or role differs from this briefing, stop and report a blocked session. MCP authority is process-bound, never selected in a tool argument.",

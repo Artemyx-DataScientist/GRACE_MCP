@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS agents (
   primary_role TEXT NOT NULL,
   capabilities_json TEXT NOT NULL,
   mimo_model TEXT,
+  mimo_agent TEXT,
   availability TEXT NOT NULL CHECK(availability IN ('available', 'unavailable')),
   updated_at TEXT NOT NULL,
   UNIQUE(project_id, name)
@@ -108,6 +109,16 @@ CREATE TABLE IF NOT EXISTS work_packages (
   assigned_junior_agent TEXT NOT NULL,
   assigned_pro_agent TEXT NOT NULL,
   worker_pro_available INTEGER NOT NULL DEFAULT 0 CHECK(worker_pro_available IN (0, 1)),
+  operation_id TEXT NOT NULL DEFAULT '',
+  authority_mode TEXT NOT NULL DEFAULT '',
+  operation_root TEXT NOT NULL DEFAULT '',
+  codex_required INTEGER NOT NULL DEFAULT 1 CHECK(codex_required IN (0, 1)),
+  codex_instance_id TEXT NOT NULL DEFAULT '',
+  glm_instance_id TEXT NOT NULL DEFAULT '',
+  branch_worktree TEXT NOT NULL DEFAULT '',
+  glm_scan_plan_report_json TEXT NOT NULL DEFAULT '{}',
+  operation_isolation_json TEXT NOT NULL DEFAULT '{}',
+  pro_api_assignment TEXT NOT NULL DEFAULT '',
   base_commit TEXT NOT NULL,
   contract_discovery_json TEXT NOT NULL DEFAULT '{}',
   test_surface_json TEXT NOT NULL DEFAULT '[]',
@@ -186,6 +197,7 @@ CREATE TABLE IF NOT EXISTS mimo_sessions (
   assigned_agent TEXT NOT NULL,
   assigned_role TEXT NOT NULL,
   mimo_model TEXT NOT NULL,
+  mimo_agent TEXT,
   mode TEXT NOT NULL CHECK(mode IN ('headless', 'tui')),
   lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('PREPARED', 'RUNNING', 'TUI_DETACHED', 'EXITED', 'FAILED', 'CANCELLED')),
   workspace_path TEXT,
@@ -260,11 +272,26 @@ class OrchestratorStore:
         with self._lock:
             self.connection.executescript(SCHEMA)
             self._ensure_column("agents", "mimo_model", "TEXT")
+            self._ensure_column("agents", "mimo_agent", "TEXT")
             self._ensure_column(
                 "work_packages",
                 "worker_pro_available",
                 "INTEGER NOT NULL DEFAULT 0 CHECK(worker_pro_available IN (0, 1))",
             )
+            self._ensure_column("work_packages", "operation_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("work_packages", "authority_mode", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("work_packages", "operation_root", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(
+                "work_packages",
+                "codex_required",
+                "INTEGER NOT NULL DEFAULT 1 CHECK(codex_required IN (0, 1))",
+            )
+            self._ensure_column("work_packages", "codex_instance_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("work_packages", "glm_instance_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("work_packages", "branch_worktree", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("work_packages", "glm_scan_plan_report_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column("work_packages", "operation_isolation_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column("work_packages", "pro_api_assignment", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column("work_packages", "contract_discovery_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column("work_packages", "test_surface_json", "TEXT NOT NULL DEFAULT '[]'")
             self._ensure_column("work_packages", "rollback_boundary", "TEXT NOT NULL DEFAULT ''")
@@ -273,6 +300,7 @@ class OrchestratorStore:
             self._ensure_column("work_packages", "cache_anchor", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column("submissions", "worker_report_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column("submissions", "worker_report_validation_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column("mimo_sessions", "mimo_agent", "TEXT")
             self.connection.execute(
                 "UPDATE work_packages SET worker_pro_available = 1 WHERE status = 'REPAIR_REQUIRED'"
             )

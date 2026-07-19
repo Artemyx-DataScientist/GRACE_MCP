@@ -3,8 +3,8 @@
 # FILE: src/grace_orchestrator/mimo.py
 # VERSION: 0.2.0
 # START_MODULE_CONTRACT
-#   PURPOSE: Launch a registered Mimo model in one isolated worktree without granting workflow authority.
-#   SCOPE: Briefing file construction, fixed Mimo argv, log paths, detached TUI launch, and process observation.
+#   PURPOSE: Launch a registered MiMo model in one isolated worktree without granting workflow authority.
+#   SCOPE: Briefing file construction, fixed MiMo argv, log paths, detached TUI launch, process observation, and rejection of external Codex transports.
 #   DEPENDS: M-ORCH-DOMAIN, M-ORCH-REPO-BOUNDARY
 #   LINKS: M-ORCH-MIMO-EXECUTOR, V-M-ORCH-MIMO-EXECUTOR, fn-launchMimoSession
 #   ROLE: RUNTIME
@@ -17,7 +17,7 @@
 #   render_work_package_briefing - creates a non-authoritative scoped worker handoff projection.
 # END_MODULE_MAP
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v0.2.1 - Inline latest repair findings in rejected-package briefings.
+#   LAST_CHANGE: v0.2.3 - Represent the process-bound shared Codex runtime without making it MiMo-launchable.
 # END_CHANGE_SUMMARY
 
 from __future__ import annotations
@@ -110,7 +110,15 @@ class MimoRunner:
         backend_model = normalized_explicit_backend_model(model)
         agent_binding = agent.strip() if isinstance(agent, str) and agent.strip() else None
         agent_args = ["--agent", agent_binding] if agent_binding else []
+        uses_free_auto = is_free_mimo_auto_backend(backend_model)
+        if is_external_codex_backend(backend_model):
+            raise OrchestratorError(
+                "External Codex workers must use their own role-bound GRACE MCP profile; "
+                "they cannot be launched through MiMo"
+            )
         if mode == MimoLaunchMode.HEADLESS:
+            if uses_free_auto:
+                raise OrchestratorError("MiMo Auto is a free TUI backend and must be launched without headless run or --model")
             return [
                 self.command,
                 "run",
@@ -126,6 +134,8 @@ class MimoRunner:
                 prompt,
             ]
         if mode == MimoLaunchMode.TUI:
+            if uses_free_auto:
+                return [self.command, *agent_args, "--trust", "--prompt", prompt]
             return [self.command, *agent_args, "--model", backend_model, "--trust", "--prompt", prompt]
         raise OrchestratorError(f"Unsupported Mimo launch mode: {mode}")
 
@@ -216,8 +226,26 @@ LEGACY_IMPLICIT_MIMO_ALIASES = frozenset(
         "auto",
         "auto-junior",
         "default",
+    }
+)
+
+FREE_MIMO_AUTO_BACKENDS = frozenset(
+    {
         "mimo-auto-junior",
     }
+)
+
+APPROVED_WORKER_GLM_BACKENDS = frozenset(
+    {
+        "zai/glm-4.7-flash",
+    }
+)
+
+# Role-bound external Codex workers. They claim and submit through their own
+# GRACE MCP profile and are deliberately not launchable by MiMo.
+SHARED_CODEX_BACKEND = "openai/codex-shared"
+EXTERNAL_CODEX_BACKENDS = frozenset(
+    {"openai/codex-luna", "openai/codex-terra", SHARED_CODEX_BACKEND}
 )
 
 
@@ -226,17 +254,34 @@ def normalized_explicit_backend_model(model: str) -> str:
     lowered = normalized.lower()
     if not normalized:
         raise OrchestratorError("Mimo backend model must be a non-empty explicit provider/model identifier")
-    if lowered in LEGACY_IMPLICIT_MIMO_ALIASES or "/" not in normalized:
+    if lowered in LEGACY_IMPLICIT_MIMO_ALIASES or ("/" not in normalized and lowered not in FREE_MIMO_AUTO_BACKENDS):
         raise OrchestratorError(
             "Mimo backend model must be explicit provider/model, for example "
-            "xiaomi/mimo-v2.5 or zai-coding-plan/glm-5.2; legacy implicit aliases are blocked"
+            "xiaomi/mimo-v2.5 or zai-coding-plan/glm-5.2, or the registered free "
+            "mimo-auto-junior backend; legacy implicit aliases are blocked"
         )
     return normalized
 
 
+def is_free_mimo_auto_backend(model: str) -> bool:
+    return model.strip().lower() in FREE_MIMO_AUTO_BACKENDS
+
+
+def is_external_codex_backend(model: str) -> bool:
+    return model.strip().lower() in EXTERNAL_CODEX_BACKENDS
+
+
 def backend_family(model: str) -> str:
     normalized = normalized_explicit_backend_model(model).lower()
+    if normalized in FREE_MIMO_AUTO_BACKENDS:
+        return "mimo_auto"
+    if normalized in APPROVED_WORKER_GLM_BACKENDS:
+        return "glm_worker"
+    if normalized in EXTERNAL_CODEX_BACKENDS:
+        return "codex_external"
     if normalized.startswith("zai-coding-plan/") and "glm" in normalized:
+        return "glm"
+    if normalized.startswith("zai/") and "glm" in normalized:
         return "glm"
     if normalized.startswith("xiaomi/mimo-") or normalized.startswith("mimo/mimo-"):
         return "mimo"
@@ -245,10 +290,19 @@ def backend_family(model: str) -> str:
 
 def validate_backend_for_role(model: str, role: OrchestratorRole) -> None:
     family = backend_family(model)
-    if role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
-        if family != "mimo":
+    if role == OrchestratorRole.WORKER_JUNIOR:
+        if family not in {"mimo", "mimo_auto", "glm_worker", "codex_external"}:
             raise OrchestratorError(
-                f"{role.value} agents must use a Xiaomi/MiMo worker backend; got {model!r}"
+                f"{role.value} agents must use a Xiaomi/MiMo worker backend, "
+                f"an approved free MiMo Auto backend, an approved Z.ai GLM worker backend, "
+                f"or the registered Luna Codex backend; got {model!r}"
+            )
+        return
+    if role == OrchestratorRole.WORKER_PRO:
+        if family not in {"mimo", "glm_worker", "codex_external"}:
+            raise OrchestratorError(
+                f"{role.value} agents must use an explicitly assigned Pro/API backend "
+                f"or an approved Z.ai GLM worker backend, or the registered Terra Codex backend; got {model!r}"
             )
         return
     if role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:

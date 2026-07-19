@@ -14,7 +14,7 @@ import pytest
 #   test_* - transition acceptance and repair-claim rejection scenarios.
 # END_MODULE_MAP
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v0.1.1 - Cover controller repair resubmission transition.
+#   LAST_CHANGE: v0.1.2 - Cover accepted-wave reopening before the single task final review.
 # END_CHANGE_SUMMARY
 
 from grace_orchestrator.models import OrchestratorError, TaskStatus, WorkPackageStatus
@@ -26,6 +26,7 @@ def test_task_machine_accepts_planned_path() -> None:
     assert_task_transition(TaskStatus.GLM_GRACE_PLANNED, TaskStatus.GLM_TESTS_PREPARED)
     assert_task_transition(TaskStatus.GLM_GRACE_PLANNED, TaskStatus.GLM_ACCEPTED)
     assert_task_transition(TaskStatus.GLM_TESTS_PREPARED, TaskStatus.GLM_ACCEPTED)
+    assert_task_transition(TaskStatus.GLM_ACCEPTED, TaskStatus.WORK_PACKAGES_CREATED)
     assert_task_transition(TaskStatus.GLM_ACCEPTED, TaskStatus.CODEX_FINAL_REVIEW)
     assert_task_transition(TaskStatus.CODEX_FINAL_REVIEW, TaskStatus.CODEX_ACCEPTED)
     assert_task_transition(TaskStatus.CODEX_ACCEPTED, TaskStatus.TASK_CLOSED)

@@ -20,7 +20,7 @@ import pytest
 #   test_* - isolated workspace, role profile, lifecycle, and missing-model coverage.
 # END_MODULE_MAP
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v0.2.0 - Added deterministic local evidence for Mimo package dispatch.
+#   LAST_CHANGE: v0.2.7 - Cover bounded worker-report preflight for the claimed shared Codex actor.
 # END_CHANGE_SUMMARY
 
 from grace_orchestrator.mimo import MimoLaunchResult, MimoRunner
@@ -30,6 +30,7 @@ from grace_orchestrator.models import (
     MimoSessionStatus,
     OrchestratorError,
     OrchestratorRole,
+    TaskStatus,
     WorkPackageStatus,
 )
 from grace_orchestrator.repo import RepositoryBoundary
@@ -161,6 +162,285 @@ def test_mimo_dispatch_creates_isolated_worktree_and_audited_briefing(tmp_path: 
 def test_work_package_creation_rejects_missing_registered_model_before_dispatch(tmp_path: Path) -> None:
     with pytest.raises(OrchestratorError, match="explicit provider/model"):
         _ready_service(tmp_path, junior_model=None)
+
+
+def test_model_less_shared_codex_actor_can_receive_and_claim_package_without_mimo_launch(
+    tmp_path: Path,
+) -> None:
+    service, runner, glm, task, old_package = _ready_service(tmp_path)
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    service.cancel_work_package(glm, old_package["id"], "replace MiMo route with shared Codex")
+    service.register_agent(
+        codex,
+        task["project_id"],
+        codex.name,
+        OrchestratorRole.CODEX,
+        [
+            OrchestratorRole.CODEX,
+            OrchestratorRole.TEST_OWNER,
+            OrchestratorRole.WORKER_JUNIOR,
+            OrchestratorRole.WORKER_PRO,
+        ],
+    )
+
+    package = service.create_work_package(
+        glm,
+        task["id"],
+        "shared Codex worker",
+        "execute bounded change in the current Terra or Luna conversation",
+        ["src/**"],
+        [],
+        codex.name,
+        codex.name,
+        old_package["base_commit"],
+        **packet_kwargs(
+            module_id="M-ORCH-MIMO-EXECUTOR",
+            verification_id="V-M-ORCH-MIMO-EXECUTOR",
+        ),
+    )
+    assigned = service.assign_work_package(glm, package["id"])
+
+    with pytest.raises(OrchestratorError, match="must never be launched through MiMo"):
+        service.launch_mimo_session(glm, package["id"], MimoLaunchMode.TUI)
+
+    claimed = service.claim_work_package(codex, package["id"])
+    report_gate = service.validate_worker_report(
+        codex,
+        package["id"],
+        worker_report(
+            task_id=task["id"],
+            package_id=package["id"],
+            files_changed=["src/worker.py"],
+            module_id="M-ORCH-MIMO-EXECUTOR",
+        ),
+        evidence_files=["src/worker.py"],
+    )
+
+    assert assigned["assigned_junior_agent"] == codex.name
+    assert assigned["assigned_pro_agent"] == codex.name
+    assert claimed["status"] == WorkPackageStatus.CLAIMED_JUNIOR.value
+    assert claimed["claimed_by_agent"] == codex.name
+    assert report_gate["status"] == "pass"
+    assert runner.launches == []
+
+
+def test_zai_glm_flash_worker_backend_dispatches_without_glm_planner_authority(tmp_path: Path) -> None:
+    service, runner, glm, task, package = _ready_service(tmp_path, junior_model="zai/glm-4.7-flash")
+    codex = _actor("codex", OrchestratorRole.CODEX)
+
+    profile = service.mimo_connection_profile(codex, task["project_id"], "mimo-2.5")
+    session = service.launch_mimo_session(glm, package["id"], MimoLaunchMode.HEADLESS)
+
+    assert profile["backend_family"] == "glm_worker"
+    assert profile["mimo_model"] == "zai/glm-4.7-flash"
+    assert session["assigned_role"] == OrchestratorRole.WORKER_JUNIOR.value
+    assert session["mimo_model"] == "zai/glm-4.7-flash"
+    assert runner.launches[0]["model"] == "zai/glm-4.7-flash"
+
+
+def test_paid_zai_glm_backend_is_not_worker_backend_by_default(tmp_path: Path) -> None:
+    with pytest.raises(OrchestratorError, match="approved Z.ai GLM worker backend"):
+        _ready_service(tmp_path, junior_model="zai/glm-5.2")
+
+
+def test_free_mimo_auto_worker_profile_uses_registered_auto_backend(tmp_path: Path) -> None:
+    service, _runner, _glm, task, _package = _ready_service(tmp_path)
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    service.register_agent(
+        codex,
+        task["project_id"],
+        "mimo-auto-junior",
+        OrchestratorRole.WORKER_JUNIOR,
+        [OrchestratorRole.WORKER_JUNIOR],
+        mimo_model="mimo-auto-junior",
+        mimo_agent="build-junior",
+    )
+
+    profile = service.mimo_connection_profile(codex, task["project_id"], "mimo-auto-junior")
+
+    assert profile["env"]["GRACE_ORCHESTRATOR_ACTOR_NAME"] == "mimo-auto-junior"
+    assert profile["mimo_agent"] == "build-junior"
+    assert profile["mimo_model"] == "mimo-auto-junior"
+    assert profile["backend_family"] == "mimo_auto"
+    assert "without --model" in profile["note"]
+
+
+def test_controller_can_assign_luna_and_external_codex_worker_cannot_launch_through_mimo(tmp_path: Path) -> None:
+    service, _runner, glm, task, package = _ready_service(tmp_path)
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    service.register_agent(
+        codex,
+        task["project_id"],
+        "luna",
+        OrchestratorRole.WORKER_JUNIOR,
+        [OrchestratorRole.WORKER_JUNIOR],
+        mimo_model="openai/codex-luna",
+    )
+
+    reassigned = service.reassign_work_package_by_controller(
+        codex, package["id"], "luna", "Sol explicitly assigned Luna"
+    )
+    profile = service.mimo_connection_profile(codex, task["project_id"], "luna")
+
+    assert reassigned["assigned_junior_agent"] == "luna"
+    assert reassigned["status"] == WorkPackageStatus.ASSIGNED.value
+    assert profile["transport"] == "external_codex"
+    assert profile["env"]["GRACE_ORCHESTRATOR_ACTOR_NAME"] == "luna"
+    assert "MiMo launch is forbidden" in profile["note"]
+    assert any(
+        event["event_type"] == "work_package.reassigned_by_authority"
+        for event in service.list_audit(task_id=task["id"])
+    )
+    with pytest.raises(OrchestratorError, match="cannot be launched through mimo.launch_package"):
+        service.launch_mimo_session(glm, package["id"], MimoLaunchMode.TUI)
+
+
+def test_terra_is_accepted_as_an_explicit_external_pro_backend(tmp_path: Path) -> None:
+    service, _runner, _glm, task, _package = _ready_service(tmp_path)
+    codex = _actor("codex", OrchestratorRole.CODEX)
+
+    terra = service.register_agent(
+        codex,
+        task["project_id"],
+        "terra",
+        OrchestratorRole.WORKER_PRO,
+        [OrchestratorRole.WORKER_PRO],
+        mimo_model="openai/codex-terra",
+    )
+
+    assert terra["primary_role"] == OrchestratorRole.WORKER_PRO.value
+
+
+def test_controller_cannot_reassign_an_independent_glm_direct_package(tmp_path: Path) -> None:
+    service, _runner, _glm, task, package = _ready_service(tmp_path)
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    with service.store.transaction() as conn:
+        conn.execute(
+            "UPDATE work_packages SET authority_mode = 'glm_direct', codex_required = 0 WHERE id = ?",
+            (package["id"],),
+        )
+
+    with pytest.raises(OrchestratorError, match="independent glm_direct"):
+        service.reassign_work_package_by_controller(codex, package["id"], "mimo-2.5", "not authorized")
+
+
+def test_effective_glm_can_reassign_an_independent_glm_direct_package(tmp_path: Path) -> None:
+    service, _runner, glm, task, package = _ready_service(tmp_path)
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    service.register_agent(
+        codex,
+        task["project_id"],
+        "luna",
+        OrchestratorRole.WORKER_JUNIOR,
+        [OrchestratorRole.WORKER_JUNIOR],
+        mimo_model="openai/codex-luna",
+    )
+    with service.store.transaction() as conn:
+        conn.execute(
+            "UPDATE work_packages SET authority_mode = 'glm_direct', codex_required = 0 WHERE id = ?",
+            (package["id"],),
+        )
+
+    reassigned = service.reassign_work_package(
+        glm, package["id"], "luna", "GLM root selected Luna"
+    )
+
+    assert reassigned["assigned_junior_agent"] == "luna"
+    assert any(
+        event["event_type"] == "work_package.reassigned_by_authority"
+        and event["effective_role"] == OrchestratorRole.GLM.value
+        for event in service.list_audit(task_id=task["id"])
+    )
+
+
+def test_exact_package_assignment_allows_multirole_codex_actor_to_claim_as_junior(tmp_path: Path) -> None:
+    service, _runner, _glm, task, package = _ready_service(tmp_path)
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    service.register_agent(
+        codex,
+        task["project_id"],
+        codex.name,
+        OrchestratorRole.CODEX,
+        [OrchestratorRole.CODEX, OrchestratorRole.WORKER_JUNIOR],
+        mimo_model="openai/codex-luna",
+    )
+    with service.store.transaction() as conn:
+        conn.execute(
+            "UPDATE work_packages SET assigned_junior_agent = ? WHERE id = ?",
+            (codex.name, package["id"]),
+        )
+
+    claimed = service.claim_work_package(codex, package["id"])
+
+    assert claimed["status"] == WorkPackageStatus.CLAIMED_JUNIOR.value
+    assert claimed["claimed_by_agent"] == codex.name
+
+
+def test_shared_codex_actor_can_never_be_launched_through_mimo(tmp_path: Path) -> None:
+    service, _runner, glm, task, package = _ready_service(tmp_path)
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    service.register_agent(
+        codex,
+        task["project_id"],
+        codex.name,
+        OrchestratorRole.CODEX,
+        [OrchestratorRole.CODEX, OrchestratorRole.WORKER_JUNIOR],
+        mimo_model="mimo-auto-junior",
+    )
+    with service.store.transaction() as conn:
+        conn.execute(
+            "UPDATE work_packages SET assigned_junior_agent = ? WHERE id = ?",
+            (codex.name, package["id"]),
+        )
+
+    with pytest.raises(OrchestratorError, match="must never be launched through MiMo"):
+        service.launch_mimo_session(glm, package["id"], MimoLaunchMode.TUI)
+
+
+def test_cancel_last_active_package_restores_prepared_state_and_allows_recreation(tmp_path: Path) -> None:
+    service, _runner, glm, task, package = _ready_service(tmp_path)
+
+    cancelled = service.cancel_work_package(glm, package["id"], "replace worker topology")
+    recovered_task = service.get_task(task["id"])
+
+    assert cancelled["status"] == WorkPackageStatus.CANCELLED.value
+    assert recovered_task["status"] == TaskStatus.GLM_TESTS_PREPARED.value
+
+    replacement = service.create_work_package(
+        glm,
+        task["id"],
+        "replacement",
+        "recreated after cancel-all",
+        ["src/**"],
+        [],
+        "mimo-2.5",
+        "mimo-2.5-pro",
+        _git(Path(service.get_project(task["project_id"])["repo_path"]), "rev-parse", "HEAD"),
+        **packet_kwargs(module_id="M-ORCH-MIMO-EXECUTOR", verification_id="V-M-ORCH-MIMO-EXECUTOR"),
+    )
+
+    assert replacement["status"] == WorkPackageStatus.CREATED.value
+
+
+def test_controller_can_repair_a_legacy_cancel_all_stuck_task(tmp_path: Path) -> None:
+    service, _runner, glm, task, package = _ready_service(tmp_path)
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    service.cancel_work_package(glm, package["id"], "cancel old topology")
+    with service.store.transaction() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ?",
+            (TaskStatus.WORK_PACKAGES_ASSIGNED.value, task["id"]),
+        )
+
+    repaired = service.recover_task_after_cancel_all(
+        codex, task["id"], "legacy cancel-all left the task stuck"
+    )
+
+    assert repaired["status"] == TaskStatus.GLM_TESTS_PREPARED.value
+    assert any(
+        event["event_type"] == "task.cancel_all_state_repaired"
+        for event in service.list_audit(task_id=task["id"])
+    )
 
 
 def test_detached_tui_session_is_not_cancellable_by_the_service(tmp_path: Path) -> None:
@@ -435,17 +715,49 @@ def test_mimo_runner_builds_trusted_tui_argv(tmp_path: Path) -> None:
     assert "--dangerously-skip-permissions" not in argv
 
 
-def test_mimo_runner_rejects_legacy_implicit_auto_junior_tui(tmp_path: Path) -> None:
+def test_mimo_runner_builds_free_auto_tui_without_model_flag(tmp_path: Path) -> None:
     runner = MimoRunner(tmp_path, command="mimo")
 
-    with pytest.raises(OrchestratorError, match="legacy implicit aliases are blocked"):
+    argv = runner.build_command(
+        mode=MimoLaunchMode.TUI,
+        model="mimo-auto-junior",
+        agent="build-junior",
+        workspace_path=tmp_path / "workspace",
+        briefing_path=tmp_path / "briefing.md",
+        session_id=7,
+    )
+
+    assert argv[1:4] == ["--agent", "build-junior", "--trust"]
+    assert "--model" not in argv
+    assert "--prompt" in argv
+    assert "--dangerously-skip-permissions" not in argv
+
+
+def test_mimo_runner_rejects_free_auto_headless(tmp_path: Path) -> None:
+    runner = MimoRunner(tmp_path, command="mimo")
+
+    with pytest.raises(OrchestratorError, match="free TUI backend"):
         runner.build_command(
-            mode=MimoLaunchMode.TUI,
+            mode=MimoLaunchMode.HEADLESS,
             model="mimo-auto-junior",
             workspace_path=tmp_path / "workspace",
             briefing_path=tmp_path / "briefing.md",
             session_id=7,
         )
+
+
+def test_mimo_runner_rejects_generic_auto_aliases(tmp_path: Path) -> None:
+    runner = MimoRunner(tmp_path, command="mimo")
+
+    for model in ("auto", "auto-junior", "default"):
+        with pytest.raises(OrchestratorError, match="legacy implicit aliases are blocked"):
+            runner.build_command(
+                mode=MimoLaunchMode.TUI,
+                model=model,
+                workspace_path=tmp_path / "workspace",
+                briefing_path=tmp_path / "briefing.md",
+                session_id=7,
+            )
 
 
 def test_mimo_runner_pins_mimocode_agent_with_explicit_model_for_tui(tmp_path: Path) -> None:

@@ -18,7 +18,7 @@
 #   assert_work_package_transition - rejects invalid worker and repair states.
 # END_MODULE_MAP
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v0.1.2 - Allow degraded free-MiMo junior repair when Pro routing is unavailable.
+#   LAST_CHANGE: v0.1.4 - Allow an accepted package wave to reopen package creation before the single final review.
 # END_CHANGE_SUMMARY
 
 from __future__ import annotations
@@ -40,16 +40,24 @@ TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
         TaskStatus.WORK_PACKAGES_CREATED,
         TaskStatus.GLM_ACCEPTED,
     },
-    TaskStatus.WORK_PACKAGES_CREATED: {TaskStatus.WORK_PACKAGES_ASSIGNED},
+    TaskStatus.WORK_PACKAGES_CREATED: {
+        TaskStatus.WORK_PACKAGES_ASSIGNED,
+        TaskStatus.GLM_TESTS_PREPARED,
+    },
     TaskStatus.WORK_PACKAGES_ASSIGNED: {
+        TaskStatus.GLM_TESTS_PREPARED,
         TaskStatus.GLM_ACCEPTED,
         TaskStatus.GLM_REJECTED_REPAIR_REQUIRED,
     },
     TaskStatus.GLM_REJECTED_REPAIR_REQUIRED: {
+        TaskStatus.GLM_TESTS_PREPARED,
         TaskStatus.WORK_PACKAGES_ASSIGNED,
         TaskStatus.GLM_ACCEPTED,
     },
-    TaskStatus.GLM_ACCEPTED: {TaskStatus.CODEX_FINAL_REVIEW},
+    TaskStatus.GLM_ACCEPTED: {
+        TaskStatus.WORK_PACKAGES_CREATED,
+        TaskStatus.CODEX_FINAL_REVIEW,
+    },
     TaskStatus.CODEX_FINAL_REVIEW: {
         TaskStatus.CODEX_ACCEPTED,
         TaskStatus.CODEX_REJECTED_REPAIR_REQUIRED,

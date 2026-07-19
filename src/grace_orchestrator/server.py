@@ -17,7 +17,7 @@
 #   REQUIRED_RESOURCES - required workflow resource URIs.
 # END_MODULE_MAP
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v0.3.2 - Expose Codex controller repair submission for unavailable Pro repair paths.
+#   LAST_CHANGE: v0.3.6 - Expose mode-aware work-package reassignment.
 # END_CHANGE_SUMMARY
 
 from __future__ import annotations
@@ -55,6 +55,7 @@ REQUIRED_TOOLS = {
     "task.plan",
     "task.get",
     "task.get_next_action",
+    "task.recover_cancelled_packages",
     "task.request_final_review",
     "task.close",
     "role.delegate",
@@ -67,6 +68,8 @@ REQUIRED_TOOLS = {
     "gate.acceptance_review",
     "workpackage.create",
     "workpackage.assign",
+    "workpackage.reassign",
+    "workpackage.reassign_by_controller",
     "workpackage.claim",
     "workpackage.cancel",
     "submission.create",
@@ -107,7 +110,10 @@ def _next_action(status: str) -> dict[str, str]:
         "WORK_PACKAGES_CREATED": {"role": "glm", "action": "workpackage.assign"},
         "WORK_PACKAGES_ASSIGNED": {"role": "worker_junior", "action": "workpackage.claim"},
         "GLM_REJECTED_REPAIR_REQUIRED": {"role": "glm", "action": "mimo.launch_package or submission.controller_repair"},
-        "GLM_ACCEPTED": {"role": "codex", "action": "task.request_final_review"},
+        "GLM_ACCEPTED": {
+            "role": "glm_or_codex",
+            "action": "GLM workpackage.create for the next wave, or Codex task.request_final_review only after the full DAG is exhausted",
+        },
         "CODEX_FINAL_REVIEW": {"role": "codex", "action": "review.codex_submit"},
         "CODEX_ACCEPTED": {"role": "codex", "action": "task.close"},
         "TASK_CLOSED": {"role": "codex", "action": "task.next"},
@@ -247,7 +253,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
         task = service.get_task(task_id)
         next_step = _next_action(task["status"])
         blocked_reason = None
-        if next_step["role"] not in {"none", actor.primary_role.value}:
+        if next_step["role"] not in {"none", "glm_or_codex", actor.primary_role.value}:
             try:
                 service._authorize(actor, OrchestratorRole(next_step["role"]), task["project_id"], task_id)
             except OrchestratorError as error:
@@ -410,6 +416,28 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     def assign_work_package(work_package_id: int) -> dict[str, Any]:
         return _plain(service.assign_work_package(actor, work_package_id))
 
+    @mcp.tool("workpackage.reassign_by_controller", description="Audit and assign an unclaimed package to a registered junior worker under explicit Codex authority.")
+    def reassign_work_package_by_controller(
+        work_package_id: int,
+        assigned_junior_agent: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        return _plain(
+            service.reassign_work_package_by_controller(
+                actor, work_package_id, assigned_junior_agent, reason
+            )
+        )
+
+    @mcp.tool("workpackage.reassign", description="Reassign an unclaimed package using GLM authority for glm_direct and Codex authority otherwise.")
+    def reassign_work_package(
+        work_package_id: int,
+        assigned_junior_agent: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        return _plain(
+            service.reassign_work_package(actor, work_package_id, assigned_junior_agent, reason)
+        )
+
     @mcp.tool("workpackage.claim", description="Claim an assigned junior or rejected Pro repair package.")
     def claim_work_package(work_package_id: int) -> dict[str, Any]:
         return _plain(service.claim_work_package(actor, work_package_id))
@@ -417,6 +445,10 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     @mcp.tool("workpackage.cancel", description="Cancel a stale or superseded package without treating it as accepted work.")
     def cancel_work_package(work_package_id: int, reason: str) -> dict[str, Any]:
         return _plain(service.cancel_work_package(actor, work_package_id, reason))
+
+    @mcp.tool("task.recover_cancelled_packages", description="Repair a package-phase task only when every historical package is cancelled.")
+    def recover_cancelled_packages(task_id: int, reason: str) -> dict[str, Any]:
+        return _plain(service.recover_task_after_cancel_all(actor, task_id, reason))
 
     @mcp.tool("mimo.connection_profile", description="Return a role-bound STDIO MCP profile to add in Mimo for one registered agent.")
     def mimo_connection_profile(project_id: int, agent_name: str) -> dict[str, Any]:

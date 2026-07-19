@@ -16,7 +16,7 @@
 #   OrchestratorService - sole state-changing facade used by MCP tools.
 # END_MODULE_MAP
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v0.4.5 - Support iterative rejected-package repair with inline repair briefing context.
+#   LAST_CHANGE: v0.4.13 - Reopen package creation after an accepted wave while reserving final review for DAG completion.
 # END_CHANGE_SUMMARY
 
 from __future__ import annotations
@@ -38,8 +38,11 @@ from .db import OrchestratorStore
 from .hooks import HookContext, HookEvent, HookRegistry, install_default_hooks
 from .mimo import (
     MimoRunner,
+    SHARED_CODEX_BACKEND,
     backend_family,
     default_mimocode_agent_for_role,
+    is_external_codex_backend,
+    is_free_mimo_auto_backend,
     normalized_explicit_backend_model,
     render_work_package_briefing,
     validate_backend_for_role,
@@ -327,6 +330,43 @@ class OrchestratorService:
         task_id: int | None = None,
     ) -> OrchestratorRole:
         return authorize_role(actor, required_role, self._delegations(project_id, task_id))
+
+    def _authorize_assigned_worker(
+        self,
+        actor: ActorIdentity,
+        required_role: OrchestratorRole,
+        task: Mapping[str, Any],
+        package: Mapping[str, Any],
+    ) -> OrchestratorRole:
+        """Authorize only the exact assigned actor for one bounded worker role and package."""
+
+        expected_actor = (
+            package["assigned_junior_agent"]
+            if required_role == OrchestratorRole.WORKER_JUNIOR
+            else package["assigned_pro_agent"]
+        )
+        self._require_available_capability(task["project_id"], actor.name, required_role)
+        if actor.name == expected_actor:
+            return required_role
+        return self._authorize(actor, required_role, task["project_id"], task["id"])
+
+    def _resolve_registered_worker_backend(
+        self,
+        agent: Mapping[str, Any],
+        required_role: OrchestratorRole,
+    ) -> str:
+        """Resolve packet routing without treating the shared Codex actor as a MiMo process."""
+
+        if agent["primary_role"] == OrchestratorRole.CODEX.value:
+            capabilities = set(agent.get("capabilities") or [])
+            if required_role.value not in capabilities:
+                raise OrchestratorError(
+                    f"Assigned shared Codex actor {agent['name']!r} lacks capability {required_role.value}"
+                )
+            return SHARED_CODEX_BACKEND
+        model = normalized_explicit_backend_model(str(agent.get("mimo_model") or ""))
+        validate_backend_for_role(model, required_role)
+        return model
 
     def _validate_scope_patterns(self, patterns: Sequence[str], label: str) -> None:
         for pattern in patterns:
@@ -1182,8 +1222,12 @@ class OrchestratorService:
         if TaskStatus(task["status"]) not in {
             TaskStatus.GLM_TESTS_PREPARED,
             TaskStatus.WORK_PACKAGES_CREATED,
+            TaskStatus.GLM_ACCEPTED,
         }:
-            raise OrchestratorError("Work package creation requires GLM_TESTS_PREPARED or WORK_PACKAGES_CREATED task status")
+            raise OrchestratorError(
+                "Work package creation requires GLM_TESTS_PREPARED, WORK_PACKAGES_CREATED, "
+                "or GLM_ACCEPTED after a completed package wave"
+            )
         parent_allowed = _loads(task["allowed_files_json"])
         if not allowed_files or not all(self._scope_is_subset(parent_allowed, pattern) for pattern in allowed_files):
             raise OrchestratorError("Work package scope must be a subset of its parent task scope")
@@ -1197,13 +1241,20 @@ class OrchestratorService:
             raise OrchestratorError(
                 f"Assigned agent {assigned_pro_agent!r} lacks capability {OrchestratorRole.WORKER_PRO.value}"
             )
-        junior_model = normalized_explicit_backend_model(str(junior_agent.get("mimo_model") or ""))
-        validate_backend_for_role(junior_model, OrchestratorRole.WORKER_JUNIOR)
-        pro_model = normalized_explicit_backend_model(str(pro_agent.get("mimo_model") or ""))
-        validate_backend_for_role(pro_model, OrchestratorRole.WORKER_PRO)
+        junior_model = self._resolve_registered_worker_backend(
+            junior_agent, OrchestratorRole.WORKER_JUNIOR
+        )
+        pro_model = self._resolve_registered_worker_backend(
+            pro_agent, OrchestratorRole.WORKER_PRO
+        )
+        junior_is_shared_codex = junior_model == SHARED_CODEX_BACKEND
         junior_mimocode_agent = (
             str(junior_agent["mimo_agent"]).strip()
             if junior_agent.get("mimo_agent") is not None and str(junior_agent["mimo_agent"]).strip()
+            else "not-applicable (shared Codex runtime)"
+            if junior_is_shared_codex
+            else "not-applicable (external Codex session)"
+            if is_external_codex_backend(junior_model)
             else default_mimocode_agent_for_role(OrchestratorRole.WORKER_JUNIOR.value)
         )
         project = self._project(task["project_id"])
@@ -1265,6 +1316,33 @@ class OrchestratorService:
         for required_report_field in ("authority mode", "operation id"):
             if required_report_field not in report_format:
                 report_format.insert(0, required_report_field)
+        junior_family = backend_family(junior_model)
+        junior_provider = {
+            "mimo_auto": "MiMo Auto",
+            "glm_worker": "Z.ai approved worker",
+            "mimo": "Xiaomi/MiMo",
+            "codex_external": "OpenAI Codex shared runtime"
+            if junior_is_shared_codex
+            else "OpenAI Codex external worker",
+        }.get(junior_family, "unknown")
+        model_flag_policy = (
+            "must launch the registered free MiMo Auto backend without --model"
+            if is_free_mimo_auto_backend(junior_model)
+            else "shared Codex session; execute in the current authorized model-role conversation; MiMo launch is forbidden"
+            if junior_is_shared_codex
+            else "external Codex session; MiMo launch is forbidden and the role-bound GRACE MCP profile is required"
+            if is_external_codex_backend(junior_model)
+            else "must pass the explicit registered provider/model backend with --model"
+        )
+        forbidden_model_flags = (
+            "all MiMo launch and model flags are forbidden for the shared Codex runtime"
+            if junior_is_shared_codex
+            else (
+                "generic auto/default aliases are forbidden; registered mimo-auto-junior is allowed only "
+                "for worker_junior TUI launch without --model; GLM/Z.ai planner backends are forbidden for "
+                "worker_execution packages unless they are explicitly approved worker backends."
+            )
+        )
         packet = {
             "operation id": normalized_operation_id,
             "authority mode": normalized_authority_mode,
@@ -1285,12 +1363,16 @@ class OrchestratorService:
             "worker runtime profile": assigned_junior_agent,
             "actual worker identity": assigned_junior_agent,
             "mimocode agent": junior_mimocode_agent,
-            "backend provider": "Xiaomi",
+            "backend provider": junior_provider,
             "backend model": junior_model,
-            "launch mode": MimoLaunchMode.TUI.value,
-            "trust flag": "--trust required for generated worker worktrees",
-            "model flag policy": "must pass the explicit registered provider/model backend with --model",
-            "forbidden model flags": "legacy implicit aliases such as mimo-auto-junior/default are forbidden; GLM/Z.ai models are forbidden for worker_execution packages, but required for glm_scan_plan stages.",
+            "launch mode": "current_codex_session"
+            if junior_is_shared_codex
+            else MimoLaunchMode.TUI.value,
+            "trust flag": "not-applicable; no MiMo worktree or process is generated"
+            if junior_is_shared_codex
+            else "--trust required for generated worker worktrees",
+            "model flag policy": model_flag_policy,
+            "forbidden model flags": forbidden_model_flags,
             "pro/api assignment": pro_api_assignment.strip() or "not assigned for junior package",
             "pro backend model": pro_model,
             "claim identity": assigned_junior_agent,
@@ -1383,7 +1465,10 @@ class OrchestratorService:
                 self._package(package_id),
                 payload={"title": title},
             )
-            if TaskStatus(task["status"]) == TaskStatus.GLM_TESTS_PREPARED:
+            if TaskStatus(task["status"]) in {
+                TaskStatus.GLM_TESTS_PREPARED,
+                TaskStatus.GLM_ACCEPTED,
+            }:
                 self._advance_task(conn, actor, effective, task, TaskStatus.WORK_PACKAGES_CREATED, "task.work_packages_created")
         return self.get_work_package(package_id)
 
@@ -1424,10 +1509,85 @@ class OrchestratorService:
                 raise OrchestratorError("Only the assigned repair worker may claim the package")
         else:
             raise OrchestratorError("Only the assigned worker may claim the package in its current state")
-        effective = self._authorize(actor, required, task["project_id"], task["id"])
-        self._require_available_capability(task["project_id"], actor.name, required)
+        effective = self._authorize_assigned_worker(actor, required, task, package)
         with self.store.transaction() as conn:
             self._advance_package(conn, actor, effective, package, target, "work_package.claimed", actor.name)
+        return self.get_work_package(package_id)
+
+    def reassign_work_package_by_controller(
+        self,
+        actor: ActorIdentity,
+        package_id: int,
+        assigned_junior_agent: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Record an explicit Codex reassignment before any worker has claimed the package."""
+
+        package = self._package(package_id)
+        if str(package.get("authority_mode") or "") == "glm_direct":
+            raise OrchestratorError(
+                "Codex controller reassignment is forbidden for an independent glm_direct operation; "
+                "use workpackage.reassign from its effective GLM root"
+            )
+        return self.reassign_work_package(actor, package_id, assigned_junior_agent, reason)
+
+    def reassign_work_package(
+        self,
+        actor: ActorIdentity,
+        package_id: int,
+        assigned_junior_agent: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Reassign an unclaimed package using the authority owner selected by its operation mode."""
+
+        package = self._package(package_id)
+        task = self._task(package["task_id"])
+        required_role = (
+            OrchestratorRole.GLM
+            if str(package.get("authority_mode") or "") == "glm_direct"
+            else OrchestratorRole.CODEX
+        )
+        effective = self._authorize(actor, required_role, task["project_id"], task["id"])
+        if not reason.strip():
+            raise OrchestratorError("Work-package reassignment requires a non-empty reason")
+        current = WorkPackageStatus(package["status"])
+        if current not in {WorkPackageStatus.CREATED, WorkPackageStatus.ASSIGNED}:
+            raise OrchestratorError("Only created or unclaimed assigned packages may be reassigned")
+        replacement = self._require_available_capability(
+            task["project_id"], assigned_junior_agent, OrchestratorRole.WORKER_JUNIOR
+        )
+        previous_agent = str(package["assigned_junior_agent"])
+        timestamp = _now()
+        with self.store.transaction() as conn:
+            conn.execute(
+                "UPDATE work_packages SET assigned_junior_agent = ?, updated_at = ? WHERE id = ?",
+                (replacement["name"], timestamp, package_id),
+            )
+            if current == WorkPackageStatus.CREATED:
+                self._advance_package(
+                    conn, actor, effective, package, WorkPackageStatus.ASSIGNED, "work_package.authority_assigned"
+                )
+                fresh_task = self._task(task["id"])
+                if TaskStatus(fresh_task["status"]) == TaskStatus.WORK_PACKAGES_CREATED:
+                    self._advance_task(
+                        conn, actor, effective, fresh_task, TaskStatus.WORK_PACKAGES_ASSIGNED,
+                        "task.work_packages_assigned_by_authority",
+                    )
+            self._audit(
+                conn,
+                actor,
+                effective,
+                "work_package.reassigned_by_authority",
+                "work_package",
+                package_id,
+                {
+                    "previous_assigned_junior_agent": previous_agent,
+                    "assigned_junior_agent": replacement["name"],
+                    "reason": reason.strip(),
+                    "authority_mode": package.get("authority_mode"),
+                    "required_role": required_role.value,
+                },
+            )
         return self.get_work_package(package_id)
 
     def cancel_work_package(
@@ -1473,15 +1633,24 @@ class OrchestratorService:
                 "SELECT COUNT(*) FROM work_packages WHERE task_id = ? AND status = ?",
                 (task["id"], WorkPackageStatus.GLM_ACCEPTED.value),
             ).fetchone()[0]
-            if (
+            recoverable_task_statuses = {
+                TaskStatus.WORK_PACKAGES_CREATED,
+                TaskStatus.WORK_PACKAGES_ASSIGNED,
+                TaskStatus.GLM_REJECTED_REPAIR_REQUIRED,
+            }
+            if active_count == 0 and TaskStatus(fresh_task["status"]) in recoverable_task_statuses:
+                self._advance_task(
+                    conn,
+                    actor,
+                    effective,
+                    fresh_task,
+                    TaskStatus.GLM_TESTS_PREPARED,
+                    "task.all_work_packages_cancelled",
+                )
+            elif (
                 active_count > 0
                 and accepted_active_count == active_count
-                and TaskStatus(fresh_task["status"])
-                in {
-                    TaskStatus.WORK_PACKAGES_CREATED,
-                    TaskStatus.WORK_PACKAGES_ASSIGNED,
-                    TaskStatus.GLM_REJECTED_REPAIR_REQUIRED,
-                }
+                and TaskStatus(fresh_task["status"]) in recoverable_task_statuses
             ):
                 self._advance_task(conn, actor, effective, fresh_task, TaskStatus.GLM_ACCEPTED, "task.glm_accepted")
             self._append_handoff_event(
@@ -1493,6 +1662,57 @@ class OrchestratorService:
                 {"reason": reason.strip(), "cancelled_at": timestamp},
             )
         return self.get_work_package(package_id)
+
+    def recover_task_after_cancel_all(
+        self,
+        actor: ActorIdentity,
+        task_id: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Repair a legacy task stuck after every work package was cancelled."""
+
+        task = self._task(task_id)
+        effective = self._authorize(actor, OrchestratorRole.CODEX, task["project_id"], task_id)
+        if not reason.strip():
+            raise OrchestratorError("Cancel-all task recovery requires a non-empty reason")
+        current = TaskStatus(task["status"])
+        recoverable = {
+            TaskStatus.WORK_PACKAGES_CREATED,
+            TaskStatus.WORK_PACKAGES_ASSIGNED,
+            TaskStatus.GLM_REJECTED_REPAIR_REQUIRED,
+        }
+        if current not in recoverable:
+            raise OrchestratorError("Cancel-all task recovery requires a package-phase task status")
+        total_count = self.store.fetchone(
+            "SELECT COUNT(*) AS count FROM work_packages WHERE task_id = ?", (task_id,)
+        )
+        active_count = self.store.fetchone(
+            "SELECT COUNT(*) AS count FROM work_packages WHERE task_id = ? AND status != ?",
+            (task_id, WorkPackageStatus.CANCELLED.value),
+        )
+        if total_count is None or int(total_count["count"]) == 0:
+            raise OrchestratorError("Cancel-all task recovery requires at least one historical package")
+        if active_count is None or int(active_count["count"]) != 0:
+            raise OrchestratorError("Cancel-all task recovery is forbidden while active packages remain")
+        with self.store.transaction() as conn:
+            self._advance_task(
+                conn,
+                actor,
+                effective,
+                task,
+                TaskStatus.GLM_TESTS_PREPARED,
+                "task.cancel_all_state_repaired",
+            )
+            self._audit(
+                conn,
+                actor,
+                effective,
+                "task.cancel_all_repair_reason",
+                "task",
+                task_id,
+                {"reason": reason.strip()},
+            )
+        return self.get_task(task_id)
 
     def submit_package(
         self,
@@ -1518,7 +1738,7 @@ class OrchestratorService:
         if actor.name != package["claimed_by_agent"]:
             raise OrchestratorError("Only the worker that claimed a package may submit it")
         task = self._task(package["task_id"])
-        effective = self._authorize(actor, required, task["project_id"], task["id"])
+        effective = self._authorize_assigned_worker(actor, required, task, package)
         validate_scoped_files(
             evidence.files_changed,
             allowed_files=_loads(package["allowed_files_json"]),
@@ -2112,10 +2332,17 @@ class OrchestratorService:
             if agent.get("mimo_model") is not None and str(agent["mimo_model"]).strip()
             else ""
         )
+        model_note = (
+            "MiMo Auto free backend: launch through the configured MiMoCode agent without --model."
+            if model and is_free_mimo_auto_backend(model)
+            else "External Codex worker: use this exact environment in a dedicated Luna/Terra session; MiMo launch is forbidden."
+            if model and is_external_codex_backend(model)
+            else f"Backend model selection is separate and must stay {model!r} for this registered actor."
+        )
         package_root = Path(__file__).resolve().parents[2]
         return {
             "name": f"grace-orchestrator-{agent['name']}",
-            "transport": "stdio",
+            "transport": "external_codex" if model and is_external_codex_backend(model) else "stdio",
             "command": sys.executable,
             "args": ["-m", "grace_orchestrator"],
             "cwd": str(package_root),
@@ -2128,8 +2355,7 @@ class OrchestratorService:
             "note": (
                 "Add these fields through Mimo's stdio MCP-server dialog for this exact GRACE actor. "
                 "Each agent needs its own profile because actor identity is bound at server start. "
-                f"Launch with MiMoCode agent/profile {mimo_agent!r}; backend model selection is separate "
-                f"and must stay {model!r} for this registered actor."
+                f"Launch with MiMoCode agent/profile {mimo_agent!r}. {model_note}"
             ),
             "mimo_agent": mimo_agent,
             "mimo_model": model,
@@ -2177,6 +2403,11 @@ class OrchestratorService:
                 "Mimo dispatch requires an ASSIGNED package or a REPAIR_REQUIRED package"
             )
         agent = self._require_available_capability(project["id"], assigned_agent, required_role)
+        if agent["primary_role"] == OrchestratorRole.CODEX.value:
+            raise OrchestratorError(
+                "A shared ChatGPT/Codex actor executes its assigned package in the current model session; "
+                "it must never be launched through MiMo"
+            )
         model = agent.get("mimo_model")
         if not isinstance(model, str) or not model:
             raise OrchestratorError(
@@ -2184,6 +2415,11 @@ class OrchestratorService:
             )
         model = normalized_explicit_backend_model(model)
         validate_backend_for_role(model, required_role)
+        if is_external_codex_backend(model):
+            raise OrchestratorError(
+                "External Codex workers cannot be launched through mimo.launch_package; "
+                "open the dedicated Luna/Terra session with its role-bound GRACE MCP profile instead"
+            )
         mimo_agent = (
             str(agent["mimo_agent"]).strip()
             if agent.get("mimo_agent") is not None and str(agent["mimo_agent"]).strip()
@@ -2614,7 +2850,7 @@ class OrchestratorService:
         task = self._task(package["task_id"])
         if actor.name == package["claimed_by_agent"]:
             required = OrchestratorRole.WORKER_JUNIOR if package["status"] == WorkPackageStatus.CLAIMED_JUNIOR.value else OrchestratorRole.WORKER_PRO
-            effective = self._authorize(actor, required, task["project_id"], task["id"])
+            effective = self._authorize_assigned_worker(actor, required, task, package)
         else:
             effective = self._authorize(actor, OrchestratorRole.GLM, task["project_id"], task["id"])
         project = self._project(task["project_id"])
@@ -2717,7 +2953,7 @@ class OrchestratorService:
             raise OrchestratorError("Only the currently claimed worker may report a handoff event")
         task = self._task(package["task_id"])
         required = OrchestratorRole.WORKER_JUNIOR if package["status"] == WorkPackageStatus.CLAIMED_JUNIOR.value else OrchestratorRole.WORKER_PRO
-        effective = self._authorize(actor, required, task["project_id"], task["id"])
+        effective = self._authorize_assigned_worker(actor, required, task, package)
         if event_type not in {"WORKER_BLOCKED", "WORKER_NEEDS_CONTROLLER", "WORKER_FAILED"}:
             raise OrchestratorError("Workers may report only WORKER_BLOCKED, WORKER_NEEDS_CONTROLLER, or WORKER_FAILED")
         if not message.strip():

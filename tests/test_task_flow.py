@@ -19,7 +19,7 @@ import pytest
 #   test_* - final gate, append-only audit, and fallback capability guards.
 # END_MODULE_MAP
 # START_CHANGE_SUMMARY
-#   LAST_CHANGE: v0.1.0 - Added end-to-end local acceptance and fallback registry coverage.
+#   LAST_CHANGE: v0.1.1 - Cover two sequential package waves before one Codex final review.
 # END_CHANGE_SUMMARY
 
 from grace_orchestrator.models import ActorIdentity, OrchestratorError, OrchestratorRole, SubmissionEvidence, TaskStatus, WorkPackageStatus
@@ -211,6 +211,42 @@ def test_codex_fallback_can_drive_a_complete_local_acceptance_flow(tmp_path: Pat
         worker_report=worker_report(task_id=task["id"], package_id=second_package["id"], files_changed=["src/b.py"]),
     )
     service.review_package(codex, second_package["id"], decision="accepted", findings=[], required_fixes=[])
+    assert service.get_task(task["id"])["status"] == TaskStatus.GLM_ACCEPTED.value
+    next_wave = service.create_work_package(
+        codex,
+        task["id"],
+        title="next wave",
+        objective="continue the accepted DAG without final review",
+        allowed_files=["src/**"],
+        forbidden_files=["tests/**"],
+        assigned_junior_agent=junior.name,
+        assigned_pro_agent=pro.name,
+        base_commit="d" * 40,
+        **packet_kwargs(),
+    )
+    assert service.get_task(task["id"])["status"] == TaskStatus.WORK_PACKAGES_CREATED.value
+    service.assign_work_package(codex, next_wave["id"])
+    service.claim_work_package(junior, next_wave["id"])
+    service.submit_package(
+        junior,
+        next_wave["id"],
+        summary="implemented next wave",
+        evidence=SubmissionEvidence(
+            base_commit="d" * 40,
+            head_commit="e" * 40,
+            diff="diff --git a/src/c.py b/src/c.py",
+            diff_hash="c" * 64,
+            files_changed=["src/c.py"],
+        ),
+        tests_run=[{"command_key": "unit", "exit_code": 0}],
+        risk_notes="none",
+        worker_report=worker_report(
+            task_id=task["id"],
+            package_id=next_wave["id"],
+            files_changed=["src/c.py"],
+        ),
+    )
+    service.review_package(codex, next_wave["id"], decision="accepted", findings=[], required_fixes=[])
     assert service.get_task(task["id"])["status"] == TaskStatus.GLM_ACCEPTED.value
     for artifact_type, filename in {
         "requirements": "requirements.xml",

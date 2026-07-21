@@ -30,9 +30,29 @@ from shutil import which
 import subprocess
 from typing import Any, Mapping
 
-from .models import MimoLaunchMode, OrchestratorError, OrchestratorRole
+from .models import ExecutionRuntime, MimoLaunchMode, OrchestratorError, OrchestratorRole
 
 logger = logging.getLogger(__name__)
+
+
+def canonical_runtime(runtime: str | None) -> ExecutionRuntime:
+    if not runtime:
+        return ExecutionRuntime.EXTERNAL
+    raw = runtime.strip().lower()
+    if raw in {"antigravity-flash", "gemini-3.5-flash", "claude-opus-4.6"}:
+        raise OrchestratorError(f"Model-bound name '{runtime}' cannot be used as runtime alias")
+    if "/" in raw:
+        raw = raw.split("/")[-1]
+    for item in ExecutionRuntime:
+        if item.value.lower() == raw:
+            return item
+    return ExecutionRuntime.EXTERNAL
+
+
+def is_external_antigravity_runtime(runtime: str | None | ExecutionRuntime) -> bool:
+    if isinstance(runtime, ExecutionRuntime):
+        return runtime == ExecutionRuntime.ANTIGRAVITY
+    return canonical_runtime(runtime) == ExecutionRuntime.ANTIGRAVITY
 
 
 @dataclass(frozen=True, slots=True)

@@ -37,6 +37,7 @@ import time
 from typing import Any, Mapping, Sequence
 
 from .models import stable_hash
+from .db import OrchestratorStore
 
 TRIGGER_EVENT_TYPES = frozenset(
     {
@@ -194,13 +195,16 @@ class HostContinuationSupervisor:
         #   PURPOSE: Process each unconsumed durable event at most once according to the cursor.
         #   INPUTS: none.
         #   OUTPUTS: { dict - one scan summary }
-        #   SIDE_EFFECTS: Updates host cursor, writes host events, may launch configured Codex command.
+        #   SIDE_EFFECTS: Updates host cursor, writes host events, enqueues and processes continuation_deliveries.
         #   LINKS: M-ORCH-HOST-CONTINUATION, V-M-ORCH-HOST-CONTINUATION
         # END_CONTRACT: HostContinuationSupervisor.run_once
         # START_BLOCK_SCAN_DURABLE_RUN_EVENTS
         processed: list[dict[str, Any]] = []
         locked: list[dict[str, Any]] = []
         ignored = 0
+
+        # Phase 1: Scan event stream & insert unconsumed trigger events into SQLite continuation_deliveries
+        # Move event scan cursor immediately after inserting into continuation_deliveries
         for events_path in self._event_files():
             event_key = _relative_key(self.data_dir, events_path)
             start_index = self._cursor_count(event_key)
@@ -210,18 +214,36 @@ class HostContinuationSupervisor:
                     self._advance_cursor(event_key, event_index)
                     ignored += 1
                     continue
+
                 location = self._location_for(events_path, event_index)
-                result = self._process_trigger_event(location, event, event_key)
-                if result["status"] == "locked":
-                    locked.append(result)
+                lock_path = self._run_lock_path(location.run_id)
+                if lock_path.exists():
+                    locked.append({"status": "locked", "run_id": location.run_id, "event_index": event_index})
                     break
-                processed.append(result)
+
+                source_event_id = str(event.get("event_id") or f"evt_{location.run_id}_{event_index}")
+                continuation_id = f"cont_{stable_hash(location.run_id + '_' + source_event_id)[:16]}"
+
+                self._enqueue_continuation_delivery(
+                    continuation_id=continuation_id,
+                    run_id=location.run_id,
+                    source_event_id=source_event_id,
+                    event_location=location,
+                    event=event,
+                )
+                self._advance_cursor(event_key, event_index)
+
+        # Phase 2: Process pending deliveries from continuation_deliveries table
+        delivery_results = self._process_pending_deliveries()
+        processed = [res for res in delivery_results if res.get("status") in {"started", "retry_scheduled"}]
+
         return {
             "status": "ok",
             "processed": processed,
             "processed_count": len(processed),
             "locked": locked,
             "locked_count": len(locked),
+            "delivery_results": delivery_results,
             "ignored_count": ignored,
         }
         # END_BLOCK_SCAN_DURABLE_RUN_EVENTS
@@ -239,9 +261,12 @@ class HostContinuationSupervisor:
         task_id = int(trigger_event.get("task_id") or 0)
         package_id = int(trigger_event.get("work_package_id") or 0)
         ledger = self._ledger_snapshot(project_id, task_id, package_id)
-        package = ledger.get("package") or {}
-        session = ledger.get("latest_session") or {}
-        payload = trigger_event.get("payload") if isinstance(trigger_event.get("payload"), dict) else {}
+        raw_pkg = ledger.get("package")
+        package: dict[str, Any] = dict(raw_pkg) if isinstance(raw_pkg, dict) else {}
+        raw_sess = ledger.get("latest_session")
+        session: dict[str, Any] = dict(raw_sess) if isinstance(raw_sess, dict) else {}
+        raw_pay = trigger_event.get("payload")
+        payload: dict[str, Any] = dict(raw_pay) if isinstance(raw_pay, dict) else {}
         report_path = self._handoff_report_path(location.run_root, package_id, payload)
         controller_metadata = self._controller_metadata(location.run_root)
         module_id, verification_id = self._module_context(package)
@@ -287,10 +312,14 @@ class HostContinuationSupervisor:
     def build_controller_prompt(self, context: Mapping[str, Any]) -> str:
         """Render the compact prompt passed to a resumed or logically restarted controller."""
 
-        package = context.get("package") if isinstance(context.get("package"), dict) else {}
-        task = context.get("task") if isinstance(context.get("task"), dict) else {}
-        project = context.get("project") if isinstance(context.get("project"), dict) else {}
-        trigger = context.get("trigger_event") if isinstance(context.get("trigger_event"), dict) else {}
+        raw_package = context.get("package")
+        package: dict[str, Any] = raw_package if isinstance(raw_package, dict) else {}
+        raw_task = context.get("task")
+        task: dict[str, Any] = raw_task if isinstance(raw_task, dict) else {}
+        raw_project = context.get("project")
+        project: dict[str, Any] = raw_project if isinstance(raw_project, dict) else {}
+        raw_trigger = context.get("trigger_event")
+        trigger: dict[str, Any] = raw_trigger if isinstance(raw_trigger, dict) else {}
         allowed = _loads_json(package.get("allowed_files_json"), [])
         forbidden = _loads_json(package.get("forbidden_files_json"), [])
         test_surface = _loads_json(package.get("test_surface_json"), [])
@@ -353,13 +382,100 @@ class HostContinuationSupervisor:
             prompt.insert(18, f"- Repository path: {project.get('repo_path')}")
         return "\n".join(prompt) + "\n"
 
-    def _process_trigger_event(self, location: EventLocation, event: Mapping[str, Any], event_key: str) -> dict[str, Any]:
-        lock_path = self._run_lock_path(location.run_id)
-        if not self._acquire_lock(lock_path, location, event):
-            return {"status": "locked", "run_id": location.run_id, "event_index": location.event_index}
+    def _enqueue_continuation_delivery(
+        self,
+        continuation_id: str,
+        run_id: str,
+        source_event_id: str,
+        event_location: EventLocation,
+        event: Mapping[str, Any],
+    ) -> bool:
+        db_path = self.data_dir / "ledger.sqlite3"
+        store = OrchestratorStore(db_path)
+
+        with store.transaction() as conn:
+            existing = conn.execute(
+                "SELECT id FROM continuation_deliveries WHERE run_id = ? AND source_event_id = ?",
+                (run_id, source_event_id),
+            ).fetchone()
+            if existing is not None:
+                return False
+
+            now_str = _now()
+            conn.execute(
+                """INSERT INTO continuation_deliveries (
+                    continuation_id, run_id, source_event_id, state, attempt_count, next_attempt_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (continuation_id, run_id, source_event_id, "PENDING", 0, now_str, now_str),
+            )
+            return True
+
+    def _process_pending_deliveries(self) -> list[dict[str, Any]]:
+        db_path = self.data_dir / "ledger.sqlite3"
+        store = OrchestratorStore(db_path)
+
+        results = []
+        now_str = _now()
+        with store.transaction() as conn:
+            pending = conn.execute(
+                """SELECT * FROM continuation_deliveries 
+                   WHERE state IN ('PENDING', 'RETRY_WAIT') AND next_attempt_at <= ?
+                   ORDER BY id ASC LIMIT 10""",
+                (now_str,),
+            ).fetchall()
+
+            for row in pending:
+                deliv = dict(row)
+                res = self._dispatch_delivery(conn, deliv)
+                results.append(res)
+
+        return results
+
+    def _dispatch_delivery(self, conn: sqlite3.Connection, delivery: dict[str, Any]) -> dict[str, Any]:
+        continuation_id = delivery["continuation_id"]
+        run_id = delivery["run_id"]
+        attempts = int(delivery["attempt_count"]) + 1
+
+        if attempts > 3:
+            conn.execute(
+                "UPDATE continuation_deliveries SET state = ?, last_error = ? WHERE continuation_id = ?",
+                ("DEAD_LETTER", "Exceeded maximum attempt limit (3)", continuation_id),
+            )
+            return {"continuation_id": continuation_id, "status": "dead_lettered"}
+
+        events_path = self.data_dir / "runs" / run_id / "events.ndjson"
+        if not events_path.is_file():
+            events_path = self.data_dir / run_id / "events.ndjson"
+        if not events_path.is_file():
+            return {"continuation_id": continuation_id, "status": "events_path_missing"}
+
+        all_events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        trigger_event = None
+        event_idx = 0
+        for idx, evt in enumerate(all_events):
+            evt_id = str(evt.get("event_id") or f"evt_{run_id}_{idx}")
+            if evt_id == delivery["source_event_id"]:
+                trigger_event = evt
+                event_idx = idx
+                break
+
+        if trigger_event is None and all_events:
+            trigger_event = all_events[-1]
+            event_idx = len(all_events) - 1
+
+        if trigger_event is None:
+            return {"continuation_id": continuation_id, "status": "no_trigger_event"}
+
+        location = EventLocation(events_path, event_idx, events_path.parent, run_id)
+        lock_path = self._run_lock_path(run_id)
+
+        if not self._acquire_lock(lock_path, location, trigger_event):
+            return {"continuation_id": continuation_id, "status": "locked"}
+
         try:
-            context = self.build_run_context(location, event)
+            context = self.build_run_context(location, trigger_event)
             prompt_path = self._write_prompt(context)
+
             self._append_host_event(
                 context,
                 "HOST_CONTINUATION_DETECTED",
@@ -369,17 +485,28 @@ class HostContinuationSupervisor:
                     "event_index": location.event_index,
                 },
             )
+
             resumed = self._attempt_resume(context, prompt_path)
-            if resumed:
-                self._advance_cursor(event_key, location.event_index)
-                return {"status": "resume_started", "run_id": location.run_id, "event_index": location.event_index}
-            logical = self._attempt_logical_start(context, prompt_path)
-            self._advance_cursor(event_key, location.event_index)
-            return {
-                "status": "logical_started" if logical else "continuation_failed",
-                "run_id": location.run_id,
-                "event_index": location.event_index,
-            }
+            logical = False if resumed else self._attempt_logical_start(context, prompt_path)
+
+            if resumed or logical:
+                conn.execute(
+                    """UPDATE continuation_deliveries 
+                       SET state = ?, attempt_count = ?, controller_pid = ? 
+                       WHERE continuation_id = ?""",
+                    ("CONTROLLER_STARTED", attempts, os.getpid(), continuation_id),
+                )
+                return {"continuation_id": continuation_id, "status": "started", "attempts": attempts}
+            else:
+                backoff_sec = 5 if attempts == 1 else (30 if attempts == 2 else 120)
+                next_retry = datetime.fromtimestamp(datetime.now(UTC).timestamp() + backoff_sec, UTC).isoformat()
+                conn.execute(
+                    """UPDATE continuation_deliveries 
+                       SET state = ?, attempt_count = ?, next_attempt_at = ?, last_error = ? 
+                       WHERE continuation_id = ?""",
+                    ("RETRY_WAIT", attempts, next_retry, "Controller command failed to start", continuation_id),
+                )
+                return {"continuation_id": continuation_id, "status": "retry_scheduled", "attempts": attempts}
         finally:
             self._release_lock(lock_path)
 
@@ -492,7 +619,8 @@ class HostContinuationSupervisor:
         worktree = context.get("worker_worktree")
         if isinstance(worktree, str) and worktree and Path(worktree).is_dir():
             return Path(worktree)
-        project = context.get("project") if isinstance(context.get("project"), dict) else {}
+        raw_proj = context.get("project")
+        project: dict[str, Any] = dict(raw_proj) if isinstance(raw_proj, dict) else {}
         repo_path = project.get("repo_path")
         if isinstance(repo_path, str) and repo_path and Path(repo_path).is_dir():
             return Path(repo_path)

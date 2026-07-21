@@ -45,7 +45,7 @@ from .resources import GRACE_ARTIFACT_TYPES, RESOURCE_URIS
 from .service import OrchestratorService
 
 
-REQUIRED_TOOLS = {
+ALL_REQUIRED_TOOLS = frozenset({
     "orchestrator.whoami",
     "project.init",
     "project.set_test_commands",
@@ -54,10 +54,12 @@ REQUIRED_TOOLS = {
     "task.create_codex_task",
     "task.plan",
     "task.get",
+    "task.get_summary",
     "task.get_next_action",
     "task.recover_cancelled_packages",
     "task.request_final_review",
     "task.close",
+    "task.force_transition",
     "role.delegate",
     "grace.upsert_artifact",
     "verification.register_plan",
@@ -72,6 +74,8 @@ REQUIRED_TOOLS = {
     "workpackage.reassign_by_controller",
     "workpackage.claim",
     "workpackage.cancel",
+    "workpackage.force_reset",
+    "workpackage.get_summary",
     "submission.create",
     "submission.controller_repair",
     "submission.controller_task_completion",
@@ -89,8 +93,56 @@ REQUIRED_TOOLS = {
     "mimo.recover_orphaned_running_session",
     "mimo.record_tui_closed",
     "handoff.list_events",
+    "handoff.list_events_page",
     "handoff.wait_for_event",
     "handoff.report_worker_event",
+    "audit.list",
+    "audit.list_page",
+    "continuation.ack",
+    "continuation.resolve",
+    "continuation.get",
+    "continuation.requeue_dead_letter",
+})
+
+REQUIRED_TOOLS = ALL_REQUIRED_TOOLS
+
+ADMINISTRATIVE_TOOLS = frozenset({
+    "task.force_transition",
+    "workpackage.force_reset",
+    "continuation.ack",
+    "continuation.resolve",
+    "continuation.get",
+    "continuation.requeue_dead_letter",
+})
+
+WORKER_TOOLS = frozenset({
+    "orchestrator.whoami",
+    "workpackage.claim",
+    "workpackage.get_summary",
+    "task.get_summary",
+    "submission.create",
+    "submission.controller_repair",
+    "handoff.list_events",
+    "handoff.list_events_page",
+    "handoff.report_worker_event",
+    "audit.list",
+    "audit.list_page",
+    "repo.status",
+    "repo.diff",
+    "repo.run_tests",
+    "grace.upsert_artifact",
+    "gate.contract_discovery",
+    "gate.validate_execution_packet",
+    "gate.validate_worker_report",
+})
+
+REQUIRED_TOOLS_BY_ROLE: dict[OrchestratorRole, frozenset[str]] = {
+    OrchestratorRole.USER: ALL_REQUIRED_TOOLS,
+    OrchestratorRole.CODEX: ALL_REQUIRED_TOOLS,
+    OrchestratorRole.GLM: ALL_REQUIRED_TOOLS - ADMINISTRATIVE_TOOLS,
+    OrchestratorRole.TEST_OWNER: ALL_REQUIRED_TOOLS - ADMINISTRATIVE_TOOLS,
+    OrchestratorRole.WORKER_PRO: WORKER_TOOLS,
+    OrchestratorRole.WORKER_JUNIOR: WORKER_TOOLS,
 }
 REQUIRED_PROMPTS = PROMPT_NAMES
 REQUIRED_RESOURCES = RESOURCE_URIS
@@ -141,12 +193,32 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             "do not provide actor roles in tool arguments."
         ),
     )
+    allowed_tools_for_role = REQUIRED_TOOLS_BY_ROLE.get(actor.primary_role, ALL_REQUIRED_TOOLS)
 
-    @mcp.tool("orchestrator.whoami", description="Return server-bound actor identity.")
-    def whoami() -> dict[str, str]:
-        return {"actor_name": actor.name, "primary_role": actor.primary_role.value}
+    def tool_decorator(name: str, description: str):
+        if name in allowed_tools_for_role:
+            return mcp.tool(name, description=description)
+        def dummy_decorator(fn):
+            return fn
+        return dummy_decorator
 
-    @mcp.tool("project.init", description="Initialize local orchestration for one repository.")
+    @tool_decorator("orchestrator.whoami", description="Return server-bound actor identity.")
+    def whoami() -> dict[str, Any]:
+        granted = actor.granted_role.value if actor.granted_role else actor.primary_role.value
+        requested = actor.requested_role.value if actor.requested_role else granted
+        return {
+            "actor_id": actor.actor_id,
+            "actor_name": actor.name,
+            "primary_role": granted,
+            "requested_role": requested,
+            "granted_role": granted,
+            "runtime": actor.runtime.value if actor.runtime else None,
+            "provider": actor.provider,
+            "model": actor.model,
+            "reasoning_profile": actor.reasoning_profile,
+        }
+
+    @tool_decorator("project.init", description="Initialize local orchestration for one repository.")
     def project_init(
         name: str,
         repo_path: str,
@@ -172,14 +244,14 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             )
         )
 
-    @mcp.tool("project.set_test_commands", description="Replace the fixed project test-command allowlist.")
+    @tool_decorator("project.set_test_commands", description="Replace the fixed project test-command allowlist.")
     def set_project_test_commands(
         project_id: int,
         allowed_test_commands: dict[str, list[str]],
     ) -> dict[str, Any]:
         return _plain(service.set_allowed_test_commands(actor, project_id, allowed_test_commands))
 
-    @mcp.tool("agent.register", description="Register an available model agent and its permitted role capabilities.")
+    @tool_decorator("agent.register", description="Register an available model agent and its permitted role capabilities.")
     def register_agent(
         project_id: int,
         name: str,
@@ -188,6 +260,10 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
         availability: str = "available",
         mimo_model: str | None = None,
         mimo_agent: str | None = None,
+        runtime: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        reasoning_profile: str | None = None,
     ) -> dict[str, Any]:
         try:
             parsed_primary_role = OrchestratorRole(primary_role)
@@ -207,11 +283,11 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             )
         )
 
-    @mcp.tool("agent.set_availability", description="Record whether a registered model agent is available for routing.")
+    @tool_decorator("agent.set_availability", description="Record whether a registered model agent is available for routing.")
     def set_agent_availability(project_id: int, name: str, availability: str) -> dict[str, Any]:
         return _plain(service.set_agent_availability(actor, project_id, name, availability))
 
-    @mcp.tool("task.create_codex_task", description="Create an immutable top-level Codex task.")
+    @tool_decorator("task.create_codex_task", description="Create an immutable top-level Codex task.")
     def create_codex_task(
         project_id: int,
         title: str,
@@ -240,15 +316,15 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             )
         )
 
-    @mcp.tool("task.plan", description="Advance a Codex task into GLM GRACE planning.")
+    @tool_decorator("task.plan", description="Advance a Codex task into GLM GRACE planning.")
     def plan_task(task_id: int) -> dict[str, Any]:
         return _plain(service.plan_task(actor, task_id))
 
-    @mcp.tool("task.get", description="Read task, work packages, GRACE revisions, and reviews.")
+    @tool_decorator("task.get", description="Read task, work packages, GRACE revisions, and reviews.")
     def get_task(task_id: int) -> dict[str, Any]:
         return _plain(service.get_task(task_id))
 
-    @mcp.tool("task.get_next_action", description="Project the next valid gate without changing state.")
+    @tool_decorator("task.get_next_action", description="Project the next valid gate without changing state.")
     def get_next_action(task_id: int) -> dict[str, Any]:
         task = service.get_task(task_id)
         next_step = _next_action(task["status"])
@@ -260,15 +336,15 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
                 blocked_reason = str(error)
         return _plain({"current_state": task["status"], "next": next_step, "blocked_reason": blocked_reason})
 
-    @mcp.tool("task.request_final_review", description="Advance an all-GLM-accepted task to Codex final review.")
+    @tool_decorator("task.request_final_review", description="Advance an all-GLM-accepted task to Codex final review.")
     def request_final_review(task_id: int) -> dict[str, Any]:
         return _plain(service.request_final_review(actor, task_id))
 
-    @mcp.tool("task.close", description="Close a final Codex-accepted task.")
+    @tool_decorator("task.close", description="Close a final Codex-accepted task.")
     def close_task(task_id: int) -> dict[str, Any]:
         return _plain(service.close_task(actor, task_id))
 
-    @mcp.tool("role.delegate", description="Record explicit, expiring fallback authority for an unavailable role.")
+    @tool_decorator("role.delegate", description="Record explicit, expiring fallback authority for an unavailable role.")
     def delegate_role(
         project_id: int,
         task_id: int | None,
@@ -288,7 +364,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             service.delegate_role(actor, project_id, task_id, role, substitute_actor, role, reason, expiry)
         )
 
-    @mcp.tool("grace.upsert_artifact", description="Append a revisioned GLM-owned GRACE artifact.")
+    @tool_decorator("grace.upsert_artifact", description="Append a revisioned GLM-owned GRACE artifact.")
     def upsert_artifact(
         project_id: int,
         task_id: int,
@@ -298,7 +374,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     ) -> dict[str, Any]:
         return _plain(service.upsert_artifact(actor, project_id, task_id, artifact_type, content, path))
 
-    @mcp.tool("verification.register_plan", description="Register GLM verification planning before production packages.")
+    @tool_decorator("verification.register_plan", description="Register GLM verification planning before production packages.")
     def register_verification_plan(
         task_id: int,
         test_strategy: str,
@@ -317,7 +393,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             )
         )
 
-    @mcp.tool("gate.contract_discovery", description="Discover current contracts, graph refs, verification refs, and rule anchors for a task scope.")
+    @tool_decorator("gate.contract_discovery", description="Discover current contracts, graph refs, verification refs, and rule anchors for a task scope.")
     def contract_discovery_gate(
         project_id: int,
         affected_files: list[str],
@@ -325,11 +401,11 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     ) -> dict[str, Any]:
         return _plain(service.discover_contracts(actor, project_id, affected_files, task_id))
 
-    @mcp.tool("gate.validate_execution_packet", description="Validate a worker packet before it can be dispatched.")
+    @tool_decorator("gate.validate_execution_packet", description="Validate a worker packet before it can be dispatched.")
     def validate_execution_packet_gate(task_id: int, packet: dict[str, Any]) -> dict[str, Any]:
         return _plain(service.validate_execution_packet(actor, task_id, packet))
 
-    @mcp.tool("gate.validate_worker_report", description="Validate a worker report before submission or acceptance.")
+    @tool_decorator("gate.validate_worker_report", description="Validate a worker report before submission or acceptance.")
     def validate_worker_report_gate(
         work_package_id: int,
         worker_report: dict[str, Any],
@@ -337,15 +413,15 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     ) -> dict[str, Any]:
         return _plain(service.validate_worker_report(actor, work_package_id, worker_report, evidence_files))
 
-    @mcp.tool("gate.agent_infra_lint", description="Validate AGENTS/GRACE enforcement files without shell execution.")
+    @tool_decorator("gate.agent_infra_lint", description="Validate AGENTS/GRACE enforcement files without shell execution.")
     def agent_infra_lint_gate(project_id: int) -> dict[str, Any]:
         return _plain(service.lint_agent_infra(actor, project_id))
 
-    @mcp.tool("gate.acceptance_review", description="Project whether the task currently satisfies GLM/Codex acceptance prerequisites.")
+    @tool_decorator("gate.acceptance_review", description="Project whether the task currently satisfies GLM/Codex acceptance prerequisites.")
     def acceptance_review_gate(task_id: int) -> dict[str, Any]:
         return _plain(service.acceptance_review_gate(actor, task_id))
 
-    @mcp.tool("workpackage.create", description="Create a GLM-scoped package under a Codex task.")
+    @tool_decorator("workpackage.create", description="Create a GLM-scoped package under a Codex task.")
     def create_work_package(
         task_id: int,
         title: str,
@@ -412,11 +488,11 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             )
         )
 
-    @mcp.tool("workpackage.assign", description="Advance a created package to assigned state.")
+    @tool_decorator("workpackage.assign", description="Advance a created package to assigned state.")
     def assign_work_package(work_package_id: int) -> dict[str, Any]:
         return _plain(service.assign_work_package(actor, work_package_id))
 
-    @mcp.tool("workpackage.reassign_by_controller", description="Audit and assign an unclaimed package to a registered junior worker under explicit Codex authority.")
+    @tool_decorator("workpackage.reassign_by_controller", description="Audit and assign an unclaimed package to a registered junior worker under explicit Codex authority.")
     def reassign_work_package_by_controller(
         work_package_id: int,
         assigned_junior_agent: str,
@@ -428,7 +504,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             )
         )
 
-    @mcp.tool("workpackage.reassign", description="Reassign an unclaimed package using GLM authority for glm_direct and Codex authority otherwise.")
+    @tool_decorator("workpackage.reassign", description="Reassign an unclaimed package using GLM authority for glm_direct and Codex authority otherwise.")
     def reassign_work_package(
         work_package_id: int,
         assigned_junior_agent: str,
@@ -438,23 +514,97 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             service.reassign_work_package(actor, work_package_id, assigned_junior_agent, reason)
         )
 
-    @mcp.tool("workpackage.claim", description="Claim an assigned junior or rejected Pro repair package.")
+    @tool_decorator("workpackage.claim", description="Claim an assigned junior or rejected Pro repair package.")
     def claim_work_package(work_package_id: int) -> dict[str, Any]:
         return _plain(service.claim_work_package(actor, work_package_id))
 
-    @mcp.tool("workpackage.cancel", description="Cancel a stale or superseded package without treating it as accepted work.")
+    @tool_decorator("workpackage.cancel", description="Cancel a stale or superseded package without treating it as accepted work.")
     def cancel_work_package(work_package_id: int, reason: str) -> dict[str, Any]:
         return _plain(service.cancel_work_package(actor, work_package_id, reason))
 
-    @mcp.tool("task.recover_cancelled_packages", description="Repair a package-phase task only when every historical package is cancelled.")
+    @tool_decorator("task.recover_cancelled_packages", description="Repair a package-phase task only when every historical package is cancelled.")
     def recover_cancelled_packages(task_id: int, reason: str) -> dict[str, Any]:
         return _plain(service.recover_task_after_cancel_all(actor, task_id, reason))
 
-    @mcp.tool("mimo.connection_profile", description="Return a role-bound STDIO MCP profile to add in Mimo for one registered agent.")
+    @tool_decorator("workpackage.force_reset", description="Perform an administrative force-reset of a stuck package back to CREATED state while preserving historical evidence.")
+    def force_reset_work_package(
+        work_package_id: int,
+        reason: str,
+        expected_current_status: str,
+    ) -> dict[str, Any]:
+        return _plain(
+            service.force_reset_work_package(
+                actor,
+                work_package_id,
+                reason=reason,
+                expected_current_status=expected_current_status,
+            )
+        )
+
+    @tool_decorator("task.force_transition", description="Perform an administrative recovery state transition on a task or workpackage with optimistic locking.")
+    def force_transition(
+        entity_type: str,
+        entity_id: int,
+        target_status: str,
+        reason: str,
+        expected_current_status: str,
+        allow_terminal: bool = False,
+    ) -> dict[str, Any]:
+        return _plain(
+            service.force_transition(
+                actor,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                target_status=target_status,
+                reason=reason,
+                expected_current_status=expected_current_status,
+                allow_terminal=allow_terminal,
+            )
+        )
+
+    @tool_decorator("continuation.ack", description="Idempotently acknowledge adoption of a continuation by a revived controller.")
+    def ack_continuation(
+        continuation_id: str,
+        source_event_id: str,
+        controller_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        return _plain(
+            service.ack_continuation(
+                actor,
+                continuation_id,
+                source_event_id,
+                controller_session_id=controller_session_id,
+            )
+        )
+
+    @tool_decorator("continuation.resolve", description="Resolve a continuation delivery after successful action or terminal outcome.")
+    def resolve_continuation(
+        continuation_id: str,
+        source_event_id: str,
+        resolution_notes: str = "",
+    ) -> dict[str, Any]:
+        return _plain(
+            service.resolve_continuation(
+                actor,
+                continuation_id,
+                source_event_id,
+                resolution_notes=resolution_notes,
+            )
+        )
+
+    @tool_decorator("continuation.get", description="Fetch details of a continuation delivery record.")
+    def get_continuation(continuation_id: str) -> dict[str, Any]:
+        return _plain(service.get_continuation(continuation_id))
+
+    @tool_decorator("continuation.requeue_dead_letter", description="Manually requeue a dead-lettered continuation back to PENDING state.")
+    def requeue_dead_letter_continuation(continuation_id: str, reason: str) -> dict[str, Any]:
+        return _plain(service.requeue_dead_letter_continuation(actor, continuation_id, reason=reason))
+
+    @tool_decorator("mimo.connection_profile", description="Return a role-bound STDIO MCP profile to add in Mimo for one registered agent.")
     def mimo_connection_profile(project_id: int, agent_name: str) -> dict[str, Any]:
         return _plain(service.mimo_connection_profile(actor, project_id, agent_name))
 
-    @mcp.tool("mimo.launch_package", description="Create an isolated Git worktree and launch the assigned Mimo model in TUI mode for one package.")
+    @tool_decorator("mimo.launch_package", description="Create an isolated Git worktree and launch the assigned Mimo model in TUI mode for one package.")
     def launch_mimo_package(work_package_id: int, mode: str = "tui") -> dict[str, Any]:
         try:
             launch_mode = MimoLaunchMode(mode)
@@ -464,43 +614,43 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             raise OrchestratorError("Mimo dispatch is TUI-only; use mode='tui'")
         return _plain(service.launch_mimo_session(actor, work_package_id, launch_mode))
 
-    @mcp.tool("mimo.get_session", description="Read immutable launch evidence and current recorded state for one Mimo session.")
+    @tool_decorator("mimo.get_session", description="Read immutable launch evidence and current recorded state for one Mimo session.")
     def get_mimo_session(session_id: int) -> dict[str, Any]:
         return _plain(service.get_mimo_session(session_id))
 
-    @mcp.tool("mimo.poll_session", description="Record an observed exit code for a service-owned headless Mimo process.")
+    @tool_decorator("mimo.poll_session", description="Record an observed exit code for a service-owned headless Mimo process.")
     def poll_mimo_session(session_id: int) -> dict[str, Any]:
         return _plain(service.poll_mimo_session(actor, session_id))
 
-    @mcp.tool("mimo.cancel_session", description="Terminate only a service-owned active headless Mimo process.")
+    @tool_decorator("mimo.cancel_session", description="Terminate only a service-owned active headless Mimo process.")
     def cancel_mimo_session(session_id: int) -> dict[str, Any]:
         return _plain(service.cancel_mimo_session(actor, session_id))
 
-    @mcp.tool("mimo.recover_prepared_session", description="Record a controller-observed aborted pre-launch session, only when no workspace, briefing, or process evidence exists.")
+    @tool_decorator("mimo.recover_prepared_session", description="Record a controller-observed aborted pre-launch session, only when no workspace, briefing, or process evidence exists.")
     def recover_prepared_mimo_session(session_id: int, observation: str) -> dict[str, Any]:
         return _plain(service.recover_prepared_mimo_session(actor, session_id, observation))
 
-    @mcp.tool("mimo.recover_orphaned_running_session", description="Record a controller-observed lost headless session only after its persisted PID is absent.")
+    @tool_decorator("mimo.recover_orphaned_running_session", description="Record a controller-observed lost headless session only after its persisted PID is absent.")
     def recover_orphaned_running_mimo_session(session_id: int, observation: str) -> dict[str, Any]:
         return _plain(service.recover_orphaned_running_mimo_session(actor, session_id, observation))
 
-    @mcp.tool("mimo.record_tui_closed", description="Record a controller-observed detached Mimo TUI closure without changing package acceptance.")
+    @tool_decorator("mimo.record_tui_closed", description="Record a controller-observed detached Mimo TUI closure without changing package acceptance.")
     def record_tui_closed(session_id: int, observation: str) -> dict[str, Any]:
         return _plain(service.record_detached_mimo_session_closed(actor, session_id, observation))
 
-    @mcp.tool("handoff.list_events", description="Read machine-readable worker/controller handoff events for one package.")
+    @tool_decorator("handoff.list_events", description="Read machine-readable worker/controller handoff events for one package.")
     def list_handoff_events(work_package_id: int) -> list[dict[str, Any]]:
         return _plain(service.list_handoff_events(actor, work_package_id))
 
-    @mcp.tool("handoff.wait_for_event", description="Wait for a new machine-readable handoff event for one work package.")
+    @tool_decorator("handoff.wait_for_event", description="Wait for a new machine-readable handoff event for one work package.")
     def wait_for_handoff_event(work_package_id: int, after_event_count: int = 0, timeout_seconds: int = 600) -> dict[str, Any]:
         return _plain(service.wait_for_handoff_event(actor, work_package_id, after_event_count, timeout_seconds))
 
-    @mcp.tool("handoff.report_worker_event", description="Report a closed blocked, needs-controller, or failed worker handoff event.")
+    @tool_decorator("handoff.report_worker_event", description="Report a closed blocked, needs-controller, or failed worker handoff event.")
     def report_worker_handoff_event(work_package_id: int, event_type: str, message: str) -> dict[str, Any]:
         return _plain(service.report_worker_handoff_event(actor, work_package_id, event_type, message))
 
-    @mcp.tool("submission.create", description="Store a worker submission from server-derived Git commits.")
+    @tool_decorator("submission.create", description="Store a worker submission from server-derived Git commits.")
     def create_submission(
         work_package_id: int,
         summary: str,
@@ -515,7 +665,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
         evidence = RepositoryBoundary(Path(project["repo_path"])).derive_submission(package["base_commit"], head_commit)
         return _plain(service.submit_package(actor, work_package_id, summary, evidence, tests_run, risk_notes, worker_report))
 
-    @mcp.tool("submission.controller_repair", description="Store an audited Codex controller repair submission for a rejected package when Pro repair is unavailable.")
+    @tool_decorator("submission.controller_repair", description="Store an audited Codex controller repair submission for a rejected package when Pro repair is unavailable.")
     def create_controller_repair_submission(
         work_package_id: int,
         summary: str,
@@ -540,7 +690,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             )
         )
 
-    @mcp.tool("submission.controller_task_completion", description="Store audited Codex controller-owned task completion evidence when no worker package is required.")
+    @tool_decorator("submission.controller_task_completion", description="Store audited Codex controller-owned task completion evidence when no worker package is required.")
     def create_controller_task_completion(
         task_id: int,
         summary: str,
@@ -565,7 +715,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             )
         )
 
-    @mcp.tool("review.glm_submit", description="Submit GLM intermediate package review.")
+    @tool_decorator("review.glm_submit", description="Submit GLM intermediate package review.")
     def glm_review(
         target_id: int,
         decision: str,
@@ -574,7 +724,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     ) -> dict[str, Any]:
         return _plain(service.review_package(actor, target_id, decision, findings, required_fixes))
 
-    @mcp.tool("review.codex_submit", description="Submit Codex final task review.")
+    @tool_decorator("review.codex_submit", description="Submit Codex final task review.")
     def codex_review(
         task_id: int,
         decision: str,
@@ -583,17 +733,17 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     ) -> dict[str, Any]:
         return _plain(service.final_review(actor, task_id, decision, findings, required_fixes))
 
-    @mcp.tool("repo.status", description="Read project-local Git status without mutation.")
+    @tool_decorator("repo.status", description="Read project-local Git status without mutation.")
     def repo_status(project_id: int) -> dict[str, Any]:
         project = service.get_project(project_id)
         return _plain(RepositoryBoundary(Path(project["repo_path"])).status())
 
-    @mcp.tool("repo.diff", description="Read a project-local Git diff for a fixed scope.")
+    @tool_decorator("repo.diff", description="Read a project-local Git diff for a fixed scope.")
     def repo_diff(project_id: int, scope: str = "all", file_list: list[str] | None = None) -> dict[str, str]:
         project = service.get_project(project_id)
         return {"diff": RepositoryBoundary(Path(project["repo_path"])).diff(scope, file_list)}
 
-    @mcp.tool("repo.run_tests", description="Run a registered allowlisted test command by key.")
+    @tool_decorator("repo.run_tests", description="Run a registered allowlisted test command by key.")
     def repo_run_tests(
         project_id: int,
         task_id: int,
@@ -610,17 +760,50 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             }
         )
 
+    @mcp.tool("task.get_summary", description="Retrieve a compact, structured summary of a task, its package counts, and recommended next_action.")
+    def get_task_summary(task_id: int) -> dict[str, Any]:
+        return _plain(service.get_task_summary(task_id))
+
+    @mcp.tool("workpackage.get_summary", description="Retrieve a compact summary of a work package.")
+    def get_work_package_summary(work_package_id: int) -> dict[str, Any]:
+        return _plain(service.get_work_package_summary(work_package_id))
+
+    @mcp.tool("handoff.list_events_page", description="Paginated event retrieval for work package handoffs.")
+    def list_handoff_events_page(work_package_id: int, after_event_id: int = 0, limit: int = 20) -> dict[str, Any]:
+        return _plain(service.list_handoff_events_page(work_package_id, after_event_id=after_event_id, limit=limit))
+
+    @mcp.tool("audit.list", description="List all audit events for a task or globally.")
+    def list_audit(task_id: int | None = None) -> list[dict[str, Any]]:
+        return _plain(service.list_audit(task_id=task_id))
+
+    @mcp.tool("audit.list_page", description="Paginated audit event retrieval.")
+    def list_audit_page(task_id: int | None = None, after_audit_id: int = 0, limit: int = 20) -> dict[str, Any]:
+        return _plain(service.list_audit_page(task_id=task_id, after_audit_id=after_audit_id, limit=limit))
+
     @mcp.resource("orchestrator://project/{project_id}", mime_type="application/json")
     def project_resource(project_id: int) -> str:
         return json.dumps(service.get_project(project_id), default=str)
+
+    @mcp.resource("orchestrator://project/{project_id}/active", mime_type="application/json")
+    def project_active_resource(project_id: int) -> str:
+        snapshot = service.get_orchestrator_status_snapshot(project_id=project_id)
+        return json.dumps(snapshot, default=str)
 
     @mcp.resource("orchestrator://task/{task_id}", mime_type="application/json")
     def task_resource(task_id: int) -> str:
         return json.dumps(service.get_task(task_id), default=str)
 
+    @mcp.resource("orchestrator://task/{task_id}/summary", mime_type="application/json")
+    def task_summary_resource(task_id: int) -> str:
+        return json.dumps(service.get_task_summary(task_id), default=str)
+
     @mcp.resource("orchestrator://workpackage/{work_package_id}", mime_type="application/json")
     def work_package_resource(work_package_id: int) -> str:
         return json.dumps(service.get_work_package(work_package_id), default=str)
+
+    @mcp.resource("orchestrator://workpackage/{work_package_id}/summary", mime_type="application/json")
+    def work_package_summary_resource(work_package_id: int) -> str:
+        return json.dumps(service.get_work_package_summary(work_package_id), default=str)
 
     @mcp.resource("orchestrator://submission/{submission_id}", mime_type="application/json")
     def submission_resource(submission_id: int) -> str:

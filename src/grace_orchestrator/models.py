@@ -44,6 +44,10 @@ class OrchestratorError(ValueError):
     """A client-safe rejection of an orchestration operation."""
 
 
+class ConflictError(OrchestratorError):
+    """A rejection due to optimistic locking mismatch or stale status."""
+
+
 class OrchestratorRole(StrEnum):
     USER = "user"
     CODEX = "codex"
@@ -66,6 +70,7 @@ class TaskStatus(StrEnum):
     CODEX_FINAL_REVIEW = "CODEX_FINAL_REVIEW"
     CODEX_ACCEPTED = "CODEX_ACCEPTED"
     CODEX_REJECTED_REPAIR_REQUIRED = "CODEX_REJECTED_REPAIR_REQUIRED"
+    HUMAN_INTERVENTION_REQUIRED = "HUMAN_INTERVENTION_REQUIRED"
     TASK_CLOSED = "TASK_CLOSED"
     NEXT_TASK_READY = "NEXT_TASK_READY"
 
@@ -78,6 +83,7 @@ class WorkPackageStatus(StrEnum):
     GLM_REVIEW_IN_PROGRESS = "GLM_REVIEW_IN_PROGRESS"
     GLM_ACCEPTED = "GLM_ACCEPTED"
     REPAIR_REQUIRED = "REPAIR_REQUIRED"
+    HUMAN_INTERVENTION_REQUIRED = "HUMAN_INTERVENTION_REQUIRED"
     CLAIMED_PRO = "CLAIMED_PRO"
     CANCELLED = "CANCELLED"
 
@@ -96,16 +102,65 @@ class MimoSessionStatus(StrEnum):
     RUNNING = "RUNNING"
     TUI_DETACHED = "TUI_DETACHED"
     EXITED = "EXITED"
+    WORKER_CRASHED = "WORKER_CRASHED"
+    WORKER_EXITED_WITHOUT_HANDOFF = "WORKER_EXITED_WITHOUT_HANDOFF"
+    WORKER_UNRESPONSIVE = "WORKER_UNRESPONSIVE"
+    WATCHDOG_UNCERTAIN = "WATCHDOG_UNCERTAIN"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
 
 
+class HostContinuationEventType(StrEnum):
+    """Event types tracking host continuation delivery lifecycle."""
+
+    CONTINUATION_DISCOVERED = "CONTINUATION_DISCOVERED"
+    CONTINUATION_CONTROLLER_STARTED = "CONTINUATION_CONTROLLER_STARTED"
+    CONTINUATION_ACKNOWLEDGED = "CONTINUATION_ACKNOWLEDGED"
+    CONTINUATION_RESOLVED = "CONTINUATION_RESOLVED"
+    CONTINUATION_RETRY_SCHEDULED = "CONTINUATION_RETRY_SCHEDULED"
+    CONTINUATION_DEAD_LETTERED = "CONTINUATION_DEAD_LETTERED"
+
+
+class ContinuationDeliveryState(StrEnum):
+    """Durable state of a continuation delivery record."""
+
+    PENDING = "PENDING"
+    CLAIMED = "CLAIMED"
+    CONTROLLER_STARTED = "CONTROLLER_STARTED"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    RESOLVED = "RESOLVED"
+    RETRY_WAIT = "RETRY_WAIT"
+    DEAD_LETTER = "DEAD_LETTER"
+
+
+class ExecutionRuntime(StrEnum):
+    """Canonical execution runtime hosts in GRACE."""
+
+    CODEX = "codex"
+    ANTIGRAVITY = "antigravity"
+    MIMO_TUI = "mimo_tui"
+    EXTERNAL = "external"
+
+
 @dataclass(frozen=True, slots=True)
 class ActorIdentity:
-    """Identity bound at server startup, never supplied by an MCP tool argument."""
+    """Identity bound at server startup or registration, never trusted from client self-promotion."""
 
     name: str
     primary_role: OrchestratorRole
+    actor_id: str = ""
+    granted_role: OrchestratorRole | None = None
+    requested_role: OrchestratorRole | None = None
+    runtime: ExecutionRuntime | None = None
+    provider: str | None = None
+    model: str | None = None
+    reasoning_profile: str | None = None
+
+    def __post_init__(self) -> None:
+        if not object.__getattribute__(self, "actor_id"):
+            object.__setattr__(self, "actor_id", f"actor-{self.name}")
+        if object.__getattribute__(self, "granted_role") is None:
+            object.__setattr__(self, "granted_role", self.primary_role)
 
     @classmethod
     # START_CONTRACT: ActorIdentity.from_environment
@@ -116,17 +171,55 @@ class ActorIdentity:
     #   LINKS: M-ORCH-DOMAIN, fn-requireRole
     # END_CONTRACT: ActorIdentity.from_environment
     def from_environment(cls) -> "ActorIdentity":
+        actor_id = environ.get("GRACE_ORCHESTRATOR_ACTOR_ID", "").strip()
         name = environ.get("GRACE_ORCHESTRATOR_ACTOR_NAME", "").strip()
-        raw_role = environ.get("GRACE_ORCHESTRATOR_ACTOR_ROLE", "").strip()
+        raw_role = (
+            environ.get("GRACE_ORCHESTRATOR_ACTOR_ROLE", "").strip()
+            or environ.get("GRACE_ORCHESTRATOR_REQUESTED_ROLE", "").strip()
+        )
+        raw_runtime = environ.get("GRACE_ORCHESTRATOR_RUNTIME", "").strip()
+        provider = environ.get("GRACE_ORCHESTRATOR_PROVIDER", "").strip() or None
+        model = environ.get("GRACE_ORCHESTRATOR_MODEL", "").strip() or None
+        reasoning_profile = environ.get("GRACE_ORCHESTRATOR_REASONING_PROFILE", "").strip() or None
+
         if not name or not raw_role:
             raise OrchestratorError(
                 "ACTOR_IDENTITY_UNCONFIGURED: set GRACE_ORCHESTRATOR_ACTOR_NAME and "
                 "GRACE_ORCHESTRATOR_ACTOR_ROLE before starting the server"
             )
         try:
-            return cls(name=name, primary_role=OrchestratorRole(raw_role))
+            role = OrchestratorRole(raw_role)
         except ValueError as error:
             raise OrchestratorError(f"Unknown configured actor role: {raw_role}") from error
+
+        parsed_runtime: ExecutionRuntime | None = None
+        if raw_runtime:
+            raw_lowered = raw_runtime.lower()
+            if raw_lowered in {"antigravity", "google/antigravity"}:
+                parsed_runtime = ExecutionRuntime.ANTIGRAVITY
+            elif raw_lowered in {"codex", "openai/codex"}:
+                parsed_runtime = ExecutionRuntime.CODEX
+            elif raw_lowered in {"mimo", "mimo_tui"}:
+                parsed_runtime = ExecutionRuntime.MIMO_TUI
+            else:
+                try:
+                    parsed_runtime = ExecutionRuntime(raw_runtime)
+                except ValueError:
+                    parsed_runtime = ExecutionRuntime.EXTERNAL
+
+        effective_actor_id = actor_id or f"actor-{name}"
+
+        return cls(
+            actor_id=effective_actor_id,
+            name=name,
+            primary_role=role,
+            granted_role=role,
+            requested_role=role,
+            runtime=parsed_runtime,
+            provider=provider,
+            model=model,
+            reasoning_profile=reasoning_profile,
+        )
 
 
 @dataclass(frozen=True, slots=True)

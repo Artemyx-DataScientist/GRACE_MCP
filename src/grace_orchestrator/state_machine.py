@@ -74,20 +74,37 @@ TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
 WORK_PACKAGE_TRANSITIONS: dict[WorkPackageStatus, set[WorkPackageStatus]] = {
     WorkPackageStatus.CREATED: {WorkPackageStatus.ASSIGNED, WorkPackageStatus.CANCELLED},
     WorkPackageStatus.ASSIGNED: {WorkPackageStatus.CLAIMED_JUNIOR, WorkPackageStatus.CANCELLED},
-    WorkPackageStatus.CLAIMED_JUNIOR: {WorkPackageStatus.SUBMITTED},
-    WorkPackageStatus.CLAIMED_PRO: {WorkPackageStatus.SUBMITTED},
+    WorkPackageStatus.CLAIMED_JUNIOR: {
+        WorkPackageStatus.SUBMITTED,
+        WorkPackageStatus.CANCELLED,
+    },
+    WorkPackageStatus.CLAIMED_PRO: {
+        WorkPackageStatus.SUBMITTED,
+        WorkPackageStatus.CANCELLED,
+    },
     WorkPackageStatus.SUBMITTED: {WorkPackageStatus.GLM_REVIEW_IN_PROGRESS},
     WorkPackageStatus.GLM_REVIEW_IN_PROGRESS: {
         WorkPackageStatus.GLM_ACCEPTED,
         WorkPackageStatus.REPAIR_REQUIRED,
+        WorkPackageStatus.HUMAN_INTERVENTION_REQUIRED,
     },
     WorkPackageStatus.REPAIR_REQUIRED: {
         WorkPackageStatus.CLAIMED_JUNIOR,
         WorkPackageStatus.CLAIMED_PRO,
         WorkPackageStatus.SUBMITTED,
         WorkPackageStatus.CANCELLED,
+        WorkPackageStatus.HUMAN_INTERVENTION_REQUIRED,
+    },
+    WorkPackageStatus.HUMAN_INTERVENTION_REQUIRED: {
+        WorkPackageStatus.CREATED,
+        WorkPackageStatus.REPAIR_REQUIRED,
+        WorkPackageStatus.CANCELLED,
     },
 }
+
+
+TERMINAL_TASK_STATUSES = frozenset({TaskStatus.TASK_CLOSED, TaskStatus.NEXT_TASK_READY, TaskStatus.CODEX_ACCEPTED})
+TERMINAL_WORK_PACKAGE_STATUSES = frozenset({WorkPackageStatus.GLM_ACCEPTED, WorkPackageStatus.CANCELLED})
 
 
 def assert_task_transition(current: TaskStatus, target: TaskStatus) -> None:
@@ -120,3 +137,33 @@ def assert_work_package_transition(current: WorkPackageStatus, target: WorkPacka
         )
     logger.info("[GraceOrchestrator][domain][TRANSITION_GUARD] accepted package transition", extra={"from_status": current.value, "to_status": target.value})
     # END_BLOCK_VALIDATE_WORK_PACKAGE_TRANSITION
+
+
+def assert_administrative_transition(
+    current: TaskStatus | WorkPackageStatus,
+    target: TaskStatus | WorkPackageStatus,
+    *,
+    reason: str,
+    allow_terminal: bool = False,
+) -> None:
+    """Validate administrative recovery operations."""
+
+    if not reason or len(reason.strip()) < 10:
+        raise OrchestratorError(
+            "ADMINISTRATIVE_RECOVERY_REJECTED: reason must be a descriptive non-empty string (at least 10 characters)"
+        )
+
+    if not allow_terminal:
+        if isinstance(current, TaskStatus) and current in TERMINAL_TASK_STATUSES:
+            raise OrchestratorError(
+                f"ADMINISTRATIVE_RECOVERY_REJECTED: task is in terminal status '{current.value}'. Pass allow_terminal=True to override."
+            )
+        if isinstance(current, WorkPackageStatus) and current in TERMINAL_WORK_PACKAGE_STATUSES:
+            raise OrchestratorError(
+                f"ADMINISTRATIVE_RECOVERY_REJECTED: workpackage is in terminal status '{current.value}'. Pass allow_terminal=True to override."
+            )
+
+    logger.warning(
+        "[GraceOrchestrator][admin][RECOVERY_TRANSITION] accepted administrative transition",
+        extra={"from_status": current.value, "to_status": target.value, "reason": reason},
+    )

@@ -429,6 +429,7 @@ def test_cancelled_superseded_package_does_not_block_accepted_sibling(tmp_path: 
     glm = _actor("glm-5.2", OrchestratorRole.GLM)
     junior = _actor("mimo-2.5", OrchestratorRole.WORKER_JUNIOR)
     pro = _actor("mimo-2.5-pro", OrchestratorRole.WORKER_PRO)
+    pro = _actor("mimo-2.5-pro", OrchestratorRole.WORKER_PRO)
     project = service.init_project(codex, "demo", tmp_path, tmp_path / "grace", "main", {"unit": ["python", "-m", "pytest"]})
     service.register_agent(codex, project["id"], "glm-5.2", OrchestratorRole.GLM, [OrchestratorRole.GLM], mimo_model="zai-coding-plan/glm-5.2")
     service.register_agent(codex, project["id"], junior.name, OrchestratorRole.WORKER_JUNIOR, [OrchestratorRole.WORKER_JUNIOR], mimo_model="xiaomi/mimo-v2.5")
@@ -486,6 +487,78 @@ def test_cancelled_superseded_package_does_not_block_accepted_sibling(tmp_path: 
     assert cancelled["status"] == WorkPackageStatus.CANCELLED.value
     assert service.get_task(task["id"])["status"] == TaskStatus.GLM_ACCEPTED.value
     assert service.acceptance_review_gate(codex, task["id"])["status"] == "pass"
+
+
+def test_claimed_package_can_be_cancelled_after_worker_stop_condition(tmp_path: Path) -> None:
+    service = OrchestratorService(tmp_path / "ledger.sqlite3")
+    codex = _actor("codex", OrchestratorRole.CODEX)
+    glm = _actor("glm-5.2", OrchestratorRole.GLM)
+    junior = _actor("mimo-2.5", OrchestratorRole.WORKER_JUNIOR)
+    pro = _actor("mimo-2.5-pro", OrchestratorRole.WORKER_PRO)
+    project = service.init_project(
+        codex, "demo", tmp_path, tmp_path / "grace", "main", {"unit": ["python", "-m", "pytest"]}
+    )
+    service.register_agent(
+        codex,
+        project["id"],
+        "glm-5.2",
+        OrchestratorRole.GLM,
+        [OrchestratorRole.GLM],
+        mimo_model="zai-coding-plan/glm-5.2",
+    )
+    service.register_agent(
+        codex,
+        project["id"],
+        junior.name,
+        OrchestratorRole.WORKER_JUNIOR,
+        [OrchestratorRole.WORKER_JUNIOR],
+        mimo_model="xiaomi/mimo-v2.5",
+    )
+    service.register_agent(
+        codex,
+        project["id"],
+        pro.name,
+        OrchestratorRole.WORKER_PRO,
+        [OrchestratorRole.WORKER_PRO],
+        mimo_model="xiaomi/mimo-v2.5-pro",
+    )
+    task = service.create_codex_task(
+        codex,
+        project["id"],
+        "blocked worker",
+        "replace a package whose base violates its scope",
+        "controller cancels without fabricating a submission",
+        [],
+        [],
+        ["replacement package can be created"],
+        ["src/**"],
+        ["tests/**"],
+    )
+    service.plan_task(glm, task["id"])
+    service.register_verification_plan(glm, task["id"], test_strategy="unit", test_commands=["unit"])
+    package = service.create_work_package(
+        glm,
+        task["id"],
+        title="invalid base package",
+        objective="stop before editing",
+        allowed_files=["src/a.py"],
+        forbidden_files=["tests/**"],
+        assigned_junior_agent=junior.name,
+        assigned_pro_agent=pro.name,
+        base_commit="a" * 40,
+        **packet_kwargs(),
+    )
+    service.assign_work_package(glm, package["id"])
+    service.claim_work_package(junior, package["id"])
+
+    cancelled = service.cancel_work_package(
+        glm,
+        package["id"],
+        "worker stopped because the accepted base requires an out-of-scope dependency repair",
+    )
+
+    assert cancelled["status"] == WorkPackageStatus.CANCELLED.value
+    assert service.get_task(task["id"])["status"] == TaskStatus.GLM_TESTS_PREPARED.value
 
 
 def test_controller_owned_task_completion_can_reach_final_review_without_package(tmp_path: Path) -> None:

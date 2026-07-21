@@ -566,6 +566,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     def ack_continuation(
         continuation_id: str,
         source_event_id: str,
+        attempt_id: str | None = None,
         controller_session_id: str | None = None,
     ) -> dict[str, Any]:
         return _plain(
@@ -573,6 +574,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
                 actor,
                 continuation_id,
                 source_event_id,
+                attempt_id=attempt_id,
                 controller_session_id=controller_session_id,
             )
         )
@@ -581,14 +583,18 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     def resolve_continuation(
         continuation_id: str,
         source_event_id: str,
+        attempt_id: str | None = None,
         resolution_notes: str = "",
+        resolution_data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return _plain(
             service.resolve_continuation(
                 actor,
                 continuation_id,
                 source_event_id,
+                attempt_id=attempt_id,
                 resolution_notes=resolution_notes,
+                resolution_data=resolution_data,
             )
         )
 

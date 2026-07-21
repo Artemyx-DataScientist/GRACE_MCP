@@ -1,6 +1,5 @@
 """Tests expanding coverage for server.py error handlers, prompts, and resources."""
 
-import pytest
 
 from grace_orchestrator.models import ActorIdentity, OrchestratorRole
 from grace_orchestrator.server import _plain, create_server

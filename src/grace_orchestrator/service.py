@@ -1840,10 +1840,19 @@ class OrchestratorService:
                     f"OPTIMISTIC_LOCK_MISMATCH: workpackage {package_id} current status is '{current_status_str}', expected '{expected_current_status}'"
                 )
 
-            # Detach any active Mimo session
+            # Detach any active Mimo session (including TUI_DETACHED) without killing external process
             conn.execute(
-                "UPDATE mimo_sessions SET lifecycle_state = ?, ended_at = ? WHERE work_package_id = ? AND lifecycle_state = ?",
-                (MimoSessionStatus.CANCELLED.value, _now(), package_id, MimoSessionStatus.RUNNING.value),
+                """UPDATE mimo_sessions 
+                   SET lifecycle_state = ?, ended_at = ? 
+                   WHERE work_package_id = ? AND lifecycle_state IN (?, ?, ?)""",
+                (
+                    MimoSessionStatus.CANCELLED.value,
+                    _now(),
+                    package_id,
+                    MimoSessionStatus.RUNNING.value,
+                    MimoSessionStatus.TUI_DETACHED.value,
+                    MimoSessionStatus.PREPARED.value,
+                ),
             )
 
             # Update package back to CREATED and clear active worker claim, but preserve execution packets and submissions
@@ -3363,6 +3372,7 @@ class OrchestratorService:
         actor: ActorIdentity,
         continuation_id: str,
         source_event_id: str,
+        attempt_id: str | None = None,
         controller_session_id: str | None = None,
     ) -> dict[str, Any]:
         """Idempotently acknowledge adoption of a continuation by a revived controller."""
@@ -3381,8 +3391,19 @@ class OrchestratorService:
             if deliv["source_event_id"] != source_event_id:
                 raise OrchestratorError(f"Continuation source event mismatch for {continuation_id}")
 
-            if deliv["state"] in {"ACKNOWLEDGED", "RESOLVED"}:
+            if attempt_id and deliv.get("attempt_id") and deliv["attempt_id"] != attempt_id:
+                raise ConflictError(f"Continuation attempt_id mismatch for {continuation_id}: expected {deliv.get('attempt_id')!r}, got {attempt_id!r}")
+
+            if deliv["state"] == "ACKNOWLEDGED":
+                if controller_session_id and deliv.get("controller_session_id") and deliv["controller_session_id"] != controller_session_id:
+                    raise ConflictError("Idempotent ACK mismatch: controller_session_id differs")
                 return deliv
+
+            if deliv["state"] == "RESOLVED":
+                return deliv
+
+            if deliv["state"] not in {"CONTROLLER_STARTED", "CLAIMED"}:
+                raise ConflictError(f"Cannot ACK continuation in state {deliv['state']!r}")
 
             timestamp = _now()
             conn.execute(
@@ -3398,7 +3419,7 @@ class OrchestratorService:
                 "CONTINUATION_ACKNOWLEDGED",
                 "continuation",
                 deliv["id"],
-                {"continuation_id": continuation_id, "source_event_id": source_event_id},
+                {"continuation_id": continuation_id, "source_event_id": source_event_id, "attempt_id": attempt_id},
             )
             return dict(conn.execute("SELECT * FROM continuation_deliveries WHERE continuation_id = ?", (continuation_id,)).fetchone())
 
@@ -3407,7 +3428,9 @@ class OrchestratorService:
         actor: ActorIdentity,
         continuation_id: str,
         source_event_id: str,
+        attempt_id: str | None = None,
         resolution_notes: str = "",
+        resolution_data: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Resolve a continuation delivery after successful action or terminal outcome."""
         if actor.primary_role not in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
@@ -3425,15 +3448,22 @@ class OrchestratorService:
             if deliv["source_event_id"] != source_event_id:
                 raise OrchestratorError(f"Continuation source event mismatch for {continuation_id}")
 
+            if attempt_id and deliv.get("attempt_id") and deliv["attempt_id"] != attempt_id:
+                raise ConflictError(f"Continuation attempt_id mismatch for {continuation_id}")
+
             if deliv["state"] == "RESOLVED":
                 return deliv
 
+            if deliv["state"] != "ACKNOWLEDGED":
+                raise ConflictError(f"Cannot resolve continuation in state {deliv['state']!r}; must be ACKNOWLEDGED first")
+
             timestamp = _now()
+            res_json = _json(dict(resolution_data or {"notes": resolution_notes}))
             conn.execute(
                 """UPDATE continuation_deliveries 
-                   SET state = ?, resolved_at = ? 
+                   SET state = ?, resolved_at = ?, resolution_json = ? 
                    WHERE continuation_id = ?""",
-                ("RESOLVED", timestamp, continuation_id),
+                ("RESOLVED", timestamp, res_json, continuation_id),
             )
             self._audit(
                 conn,
@@ -3480,7 +3510,10 @@ class OrchestratorService:
             timestamp = _now()
             conn.execute(
                 """UPDATE continuation_deliveries 
-                   SET state = ?, attempt_count = 0, next_attempt_at = ?, last_error = ? 
+                   SET state = ?, attempt_count = 0, attempt_id = NULL, claimed_by = NULL,
+                       lease_expires_at = NULL, controller_pid = NULL, controller_session_id = NULL,
+                       acknowledged_at = NULL, resolved_at = NULL, resolution_json = NULL,
+                       next_attempt_at = ?, last_error = ? 
                    WHERE continuation_id = ?""",
                 ("PENDING", timestamp, f"Requeued by {actor.name}: {reason}", continuation_id),
             )

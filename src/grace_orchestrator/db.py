@@ -199,7 +199,7 @@ CREATE TABLE IF NOT EXISTS mimo_sessions (
   mimo_model TEXT NOT NULL,
   mimo_agent TEXT,
   mode TEXT NOT NULL CHECK(mode IN ('headless', 'tui')),
-  lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('PREPARED', 'RUNNING', 'TUI_DETACHED', 'EXITED', 'FAILED', 'CANCELLED')),
+  lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('PREPARED', 'RUNNING', 'TUI_DETACHED', 'EXITED', 'FAILED', 'CANCELLED', 'ABANDONED', 'WATCHDOG_UNCERTAIN')),
   workspace_path TEXT,
   briefing_path TEXT,
   command_json TEXT,
@@ -256,14 +256,17 @@ CREATE TABLE IF NOT EXISTS continuation_deliveries (
   continuation_id TEXT NOT NULL UNIQUE,
   run_id TEXT NOT NULL,
   source_event_id TEXT NOT NULL,
-  state TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('PENDING', 'CLAIMED', 'CONTROLLER_STARTED', 'ACKNOWLEDGED', 'RESOLVED', 'RETRY_WAIT', 'DEAD_LETTER')),
   attempt_count INTEGER NOT NULL DEFAULT 0,
+  attempt_id TEXT,
+  claimed_by TEXT,
   next_attempt_at TEXT NOT NULL,
   lease_expires_at TEXT,
   controller_pid INTEGER,
   controller_session_id TEXT,
   acknowledged_at TEXT,
   resolved_at TEXT,
+  resolution_json TEXT,
   last_error TEXT,
   created_at TEXT NOT NULL,
   CONSTRAINT unq_run_source UNIQUE(run_id, source_event_id)
@@ -323,9 +326,54 @@ class OrchestratorStore:
             self._ensure_column("submissions", "worker_report_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column("submissions", "worker_report_validation_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column("mimo_sessions", "mimo_agent", "TEXT")
+            self._ensure_column("continuation_deliveries", "claimed_by", "TEXT")
+            self._ensure_column("continuation_deliveries", "attempt_id", "TEXT")
+            self._ensure_column("continuation_deliveries", "resolution_json", "TEXT")
             self.connection.execute(
                 "UPDATE work_packages SET worker_pro_available = 1 WHERE status = 'REPAIR_REQUIRED'"
             )
+            
+            user_ver = self.connection.execute("PRAGMA user_version").fetchone()[0]
+            if user_ver < 2:
+                self.connection.execute("PRAGMA foreign_keys = OFF")
+                mimo_cols = [row["name"] for row in self.connection.execute("PRAGMA table_info(mimo_sessions)").fetchall()]
+                if mimo_cols:
+                    col_str = ", ".join(mimo_cols)
+                    self.connection.execute("""
+                        CREATE TABLE IF NOT EXISTS mimo_sessions_new (
+                          id INTEGER PRIMARY KEY,
+                          project_id INTEGER NOT NULL REFERENCES projects(id),
+                          task_id INTEGER NOT NULL REFERENCES tasks(id),
+                          work_package_id INTEGER NOT NULL REFERENCES work_packages(id),
+                          requested_by_agent TEXT NOT NULL,
+                          assigned_agent TEXT NOT NULL,
+                          assigned_role TEXT NOT NULL,
+                          mimo_model TEXT NOT NULL,
+                          mimo_agent TEXT,
+                          mode TEXT NOT NULL CHECK(mode IN ('headless', 'tui')),
+                          lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('PREPARED', 'RUNNING', 'TUI_DETACHED', 'EXITED', 'FAILED', 'CANCELLED', 'ABANDONED', 'WATCHDOG_UNCERTAIN')),
+                          workspace_path TEXT,
+                          briefing_path TEXT,
+                          command_json TEXT,
+                          pid INTEGER,
+                          process_started_at_os TEXT,
+                          executable_path TEXT,
+                          argv_hash TEXT,
+                          launch_nonce TEXT,
+                          stdout_path TEXT,
+                          stderr_path TEXT,
+                          exit_code INTEGER,
+                          failure_reason TEXT,
+                          created_at TEXT NOT NULL,
+                          started_at TEXT,
+                          ended_at TEXT
+                        );
+                    """)
+                    self.connection.execute(f"INSERT INTO mimo_sessions_new ({col_str}) SELECT {col_str} FROM mimo_sessions;")
+                    self.connection.execute("DROP TABLE mimo_sessions;")
+                    self.connection.execute("ALTER TABLE mimo_sessions_new RENAME TO mimo_sessions;")
+                self.connection.execute("PRAGMA user_version = 2;")
+                self.connection.execute("PRAGMA foreign_keys = ON;")
             self.connection.execute("PRAGMA journal_mode = WAL")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:

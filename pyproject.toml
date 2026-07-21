@@ -19,6 +19,7 @@ dev = ["pytest>=8.3,<9.0"]
 [project.scripts]
 grace-orchestrator-mcp = "grace_orchestrator.__main__:main"
 grace-host-continuation = "grace_orchestrator.host_continuation:main"
+grace-status = "grace_orchestrator.cli_dashboard:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 *.sqlite3
 logs/
+.coverage
+.pytest-tmp-clean/

@@ -204,6 +204,10 @@ CREATE TABLE IF NOT EXISTS mimo_sessions (
   briefing_path TEXT,
   command_json TEXT,
   pid INTEGER,
+  process_started_at_os TEXT,
+  executable_path TEXT,
+  argv_hash TEXT,
+  launch_nonce TEXT,
   stdout_path TEXT,
   stderr_path TEXT,
   exit_code INTEGER,
@@ -246,6 +250,24 @@ BEFORE DELETE ON audit_log
 BEGIN
   SELECT RAISE(ABORT, 'audit log is append-only');
 END;
+
+CREATE TABLE IF NOT EXISTS continuation_deliveries (
+  id INTEGER PRIMARY KEY,
+  continuation_id TEXT NOT NULL UNIQUE,
+  run_id TEXT NOT NULL,
+  source_event_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NOT NULL,
+  lease_expires_at TEXT,
+  controller_pid INTEGER,
+  controller_session_id TEXT,
+  acknowledged_at TEXT,
+  resolved_at TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  CONSTRAINT unq_run_source UNIQUE(run_id, source_event_id)
+);
 """
 
 
@@ -351,4 +373,13 @@ class OrchestratorStore:
 
     def close(self) -> None:
         with self._lock:
-            self.connection.close()
+            try:
+                self.connection.close()
+            except sqlite3.ProgrammingError:
+                pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass

@@ -32,7 +32,7 @@ import sqlite3
 import sys
 import threading
 import time
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from .db import OrchestratorStore
 from .hooks import HookContext, HookEvent, HookRegistry, install_default_hooks
@@ -49,6 +49,7 @@ from .mimo import (
 )
 from .models import (
     ActorIdentity,
+    ConflictError,
     MimoLaunchMode,
     MimoSessionStatus,
     OrchestratorError,
@@ -61,15 +62,18 @@ from .models import (
 )
 from .permissions import authorize_role
 from .policy import (
+    ACTIVE_WORK_PACKAGE_STATUSES,
+    BLOCKED_WORK_PACKAGE_STATUSES,
     discover_contracts as policy_discover_contracts,
     lint_agent_infra as policy_lint_agent_infra,
+    project_next_action,
     require_gate_pass,
     validate_contract_discovery as policy_validate_contract_discovery,
     validate_execution_packet as policy_validate_execution_packet,
     validate_worker_report as policy_validate_worker_report,
 )
 from .repo import RepositoryBoundary, resolve_within_root, validate_scoped_files
-from .state_machine import assert_task_transition, assert_work_package_transition
+from .state_machine import assert_administrative_transition, assert_task_transition, assert_work_package_transition
 
 logger = logging.getLogger(__name__)
 
@@ -473,7 +477,7 @@ class OrchestratorService:
                 artifact_types.add(artifact_type)
                 auto_imported.append(
                     {
-                        "artifact_id": int(cursor.lastrowid),
+                        "artifact_id": int(cursor.lastrowid or 0),
                         "artifact_type": artifact_type,
                         "path": relative_path,
                         "revision": revision,
@@ -639,7 +643,7 @@ class OrchestratorService:
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (name, str(root), str(resolved_grace), main_branch, _json(normalized_commands), timestamp, timestamp),
             )
-            project_id = int(cursor.lastrowid)
+            project_id = int(cursor.lastrowid or 0)
             conn.execute(
                 """INSERT INTO agents (project_id, name, primary_role, capabilities_json, mimo_model, mimo_agent, availability, updated_at)
                    VALUES (?, ?, ?, ?, NULL, NULL, 'available', ?)""",
@@ -878,7 +882,7 @@ class OrchestratorService:
                     timestamp,
                 ),
             )
-            task_id = int(cursor.lastrowid)
+            task_id = int(cursor.lastrowid or 0)
             self._audit(conn, actor, effective, "task.codex_created", "task", task_id, {"title": title})
             self._dispatch_hook(
                 conn,
@@ -953,7 +957,7 @@ class OrchestratorService:
                     timestamp,
                 ),
             )
-            delegation_id = int(cursor.lastrowid)
+            delegation_id = int(cursor.lastrowid or 0)
             self._audit(
                 conn,
                 actor,
@@ -1032,7 +1036,7 @@ class OrchestratorService:
                     timestamp,
                 ),
             )
-            plan_id = int(cursor.lastrowid)
+            plan_id = int(cursor.lastrowid or 0)
             self._audit(conn, actor, effective, "verification.registered", "verification_plan", plan_id, {"revision": revision})
             self._advance_task(conn, actor, effective, task, TaskStatus.GLM_TESTS_PREPARED, "task.tests_prepared")
         return _row(self.store.fetchone("SELECT * FROM verification_plans WHERE id = ?", (plan_id,)))
@@ -1067,7 +1071,7 @@ class OrchestratorService:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (project_id, task_id, artifact_type, path, content, stable_hash(content), revision, actor.name, timestamp),
             )
-            artifact_id = int(cursor.lastrowid)
+            artifact_id = int(cursor.lastrowid or 0)
             self._audit(conn, actor, effective, "grace.artifact_revision_created", "grace_artifact", artifact_id, {"artifact_type": artifact_type, "revision": revision})
             self._dispatch_hook(
                 conn,
@@ -1437,7 +1441,7 @@ class OrchestratorService:
                     timestamp,
                 ),
             )
-            package_id = int(cursor.lastrowid)
+            package_id = int(cursor.lastrowid or 0)
             self._audit(
                 conn,
                 actor,
@@ -1605,8 +1609,6 @@ class OrchestratorService:
             raise OrchestratorError("Work package cancellation requires a non-empty reason")
         current = WorkPackageStatus(package["status"])
         if current in {
-            WorkPackageStatus.CLAIMED_JUNIOR,
-            WorkPackageStatus.CLAIMED_PRO,
             WorkPackageStatus.SUBMITTED,
             WorkPackageStatus.GLM_REVIEW_IN_PROGRESS,
             WorkPackageStatus.GLM_ACCEPTED,
@@ -1714,6 +1716,159 @@ class OrchestratorService:
             )
         return self.get_task(task_id)
 
+    def force_transition(
+        self,
+        actor: ActorIdentity,
+        entity_type: str,
+        entity_id: int,
+        target_status: str,
+        *,
+        reason: str,
+        expected_current_status: str,
+        allow_terminal: bool = False,
+    ) -> dict[str, Any]:
+        """Perform an administrative recovery state transition with optimistic locking."""
+        if actor.primary_role not in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
+            raise OrchestratorError(
+                f"ADMINISTRATIVE_RECOVERY_REJECTED: role '{actor.primary_role.value}' is not authorized to perform administrative transitions. Must be USER or CODEX."
+            )
+
+        entity_type_clean = entity_type.strip().lower()
+        if entity_type_clean not in {"task", "workpackage", "work_package"}:
+            raise OrchestratorError(f"Unknown entity type for force transition: {entity_type}")
+
+        with self.store.transaction() as conn:
+            if entity_type_clean == "task":
+                task = self._task(entity_id)
+                current_status_str = task["status"]
+
+                if current_status_str != expected_current_status:
+                    raise ConflictError(
+                        f"OPTIMISTIC_LOCK_MISMATCH: task {entity_id} current status is '{current_status_str}', expected '{expected_current_status}'"
+                    )
+
+                try:
+                    curr_enum = TaskStatus(current_status_str)
+                    target_enum = TaskStatus(target_status)
+                except ValueError as err:
+                    raise OrchestratorError(f"Invalid TaskStatus value: {err}") from err
+
+                assert_administrative_transition(curr_enum, target_enum, reason=reason, allow_terminal=allow_terminal)
+
+                conn.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (target_enum.value, _now(), entity_id),
+                )
+                self._audit(
+                    conn,
+                    actor,
+                    actor.primary_role,
+                    "ADMIN_RECOVERY_EXECUTED",
+                    "task",
+                    entity_id,
+                    {
+                        "previous_status": current_status_str,
+                        "target_status": target_enum.value,
+                        "reason": reason,
+                        "allow_terminal": allow_terminal,
+                    },
+                )
+                return self._task(entity_id)
+
+            else:
+                pkg = self._package(entity_id)
+                current_status_str = pkg["status"]
+
+                if current_status_str != expected_current_status:
+                    raise ConflictError(
+                        f"OPTIMISTIC_LOCK_MISMATCH: workpackage {entity_id} current status is '{current_status_str}', expected '{expected_current_status}'"
+                    )
+
+                try:
+                    wp_curr_enum = WorkPackageStatus(current_status_str)
+                    wp_target_enum = WorkPackageStatus(target_status)
+                except ValueError as err:
+                    raise OrchestratorError(f"Invalid WorkPackageStatus value: {err}") from err
+
+                assert_administrative_transition(wp_curr_enum, wp_target_enum, reason=reason, allow_terminal=allow_terminal)
+
+                conn.execute(
+                    "UPDATE work_packages SET status = ?, updated_at = ? WHERE id = ?",
+                    (wp_target_enum.value, _now(), entity_id),
+                )
+                self._audit(
+                    conn,
+                    actor,
+                    actor.primary_role,
+                    "ADMIN_RECOVERY_EXECUTED",
+                    "work_package",
+                    entity_id,
+                    {
+                        "previous_status": current_status_str,
+                        "target_status": wp_target_enum.value,
+                        "reason": reason,
+                        "allow_terminal": allow_terminal,
+                    },
+                )
+                return self._package(entity_id)
+
+    def force_reset_work_package(
+        self,
+        actor: ActorIdentity,
+        package_id: int,
+        *,
+        reason: str,
+        expected_current_status: str,
+    ) -> dict[str, Any]:
+        """Force-reset a stuck work package back to CREATED state while preserving historical evidence."""
+        if actor.primary_role not in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
+            raise OrchestratorError(
+                f"ADMINISTRATIVE_RECOVERY_REJECTED: role '{actor.primary_role.value}' is not authorized to reset work packages. Must be USER or CODEX."
+            )
+
+        if not reason or len(reason.strip()) < 10:
+            raise OrchestratorError(
+                "ADMINISTRATIVE_RECOVERY_REJECTED: reason must be a descriptive non-empty string (at least 10 characters)"
+            )
+
+        with self.store.transaction() as conn:
+            pkg = self._package(package_id)
+            current_status_str = pkg["status"]
+
+            if current_status_str != expected_current_status:
+                raise ConflictError(
+                    f"OPTIMISTIC_LOCK_MISMATCH: workpackage {package_id} current status is '{current_status_str}', expected '{expected_current_status}'"
+                )
+
+            # Detach any active Mimo session
+            conn.execute(
+                "UPDATE mimo_sessions SET lifecycle_state = ?, ended_at = ? WHERE work_package_id = ? AND lifecycle_state = ?",
+                (MimoSessionStatus.CANCELLED.value, _now(), package_id, MimoSessionStatus.RUNNING.value),
+            )
+
+            # Update package back to CREATED and clear active worker claim, but preserve execution packets and submissions
+            conn.execute(
+                """UPDATE work_packages 
+                   SET status = ?, claimed_by_agent = NULL, updated_at = ? 
+                   WHERE id = ?""",
+                (WorkPackageStatus.CREATED.value, _now(), package_id),
+            )
+
+            self._audit(
+                conn,
+                actor,
+                actor.primary_role,
+                "ADMIN_WORK_PACKAGE_RESET",
+                "work_package",
+                package_id,
+                {
+                    "previous_status": current_status_str,
+                    "target_status": WorkPackageStatus.CREATED.value,
+                    "reason": reason,
+                },
+            )
+            return self._package(package_id)
+
     def submit_package(
         self,
         actor: ActorIdentity,
@@ -1781,7 +1936,7 @@ class OrchestratorService:
                     timestamp,
                 ),
             )
-            submission_id = int(cursor.lastrowid)
+            submission_id = int(cursor.lastrowid or 0)
             self._audit(
                 conn,
                 actor,
@@ -1898,7 +2053,7 @@ class OrchestratorService:
                     timestamp,
                 ),
             )
-            submission_id = int(cursor.lastrowid)
+            submission_id = int(cursor.lastrowid or 0)
             self._audit(
                 conn,
                 actor,
@@ -1976,7 +2131,8 @@ class OrchestratorService:
         # START_BLOCK_COMMIT_CONTROLLER_OWNED_COMPLETION
         task = self._task(task_id)
         effective = self._authorize(actor, OrchestratorRole.CODEX, task["project_id"], task_id)
-        package_count = self.store.fetchone("SELECT COUNT(*) AS count FROM work_packages WHERE task_id = ?", (task_id,))["count"]
+        count_row = self.store.fetchone("SELECT COUNT(*) AS count FROM work_packages WHERE task_id = ?", (task_id,))
+        package_count = count_row["count"] if count_row is not None else 0
         if package_count:
             raise OrchestratorError("Controller task completion is only allowed when the task has no work packages")
         if TaskStatus(task["status"]) not in {TaskStatus.GLM_GRACE_PLANNED, TaskStatus.GLM_TESTS_PREPARED}:
@@ -2027,7 +2183,7 @@ class OrchestratorService:
                     timestamp,
                 ),
             )
-            review_id = int(cursor.lastrowid)
+            review_id = int(cursor.lastrowid or 0)
             self._audit(
                 conn,
                 actor,
@@ -2096,10 +2252,22 @@ class OrchestratorService:
             reviewed = self._package(package_id)
             if decision == "accepted":
                 target = WorkPackageStatus.GLM_ACCEPTED
-            elif decision == "rejected_repair_required":
-                target = WorkPackageStatus.REPAIR_REQUIRED
             else:
-                target = WorkPackageStatus.REPAIR_REQUIRED
+                prev_rejections = conn.execute(
+                    "SELECT COUNT(*) AS count FROM reviews WHERE target_type = 'work_package' AND target_id = ? AND decision != 'accepted'",
+                    (package_id,),
+                ).fetchone()
+                rejection_count = int(prev_rejections["count"]) if prev_rejections else 0
+
+                if rejection_count >= 2:
+                    target = WorkPackageStatus.HUMAN_INTERVENTION_REQUIRED
+                    logger.warning(
+                        "[GraceOrchestrator][circuit_breaker] Package %d repair limit reached (%d rejections), pausing for human intervention",
+                        package_id,
+                        rejection_count + 1,
+                    )
+                else:
+                    target = WorkPackageStatus.REPAIR_REQUIRED
             self._advance_package(conn, actor, effective, reviewed, target, "work_package.review_resolved")
             cursor = conn.execute(
                 """INSERT INTO reviews (
@@ -2108,7 +2276,7 @@ class OrchestratorService:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 ("work_package", package_id, actor.primary_role.value, actor.name, effective.value, decision, _json(list(findings)), _json(list(required_fixes)), timestamp),
             )
-            review_id = int(cursor.lastrowid)
+            review_id = int(cursor.lastrowid or 0)
             self._audit(conn, actor, effective, "review.glm_submitted", "review", review_id, {"decision": decision, "work_package_id": package_id})
             self._dispatch_hook(
                 conn,
@@ -2237,7 +2405,7 @@ class OrchestratorService:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 ("task", task_id, actor.primary_role.value, actor.name, effective.value, decision, _json(list(findings)), _json(list(required_fixes)), timestamp),
             )
-            review_id = int(cursor.lastrowid)
+            review_id = int(cursor.lastrowid or 0)
             self._audit(conn, actor, effective, "review.codex_submitted", "review", review_id, {"decision": decision, "task_id": task_id})
             self._advance_task(conn, actor, effective, task, target, "task.codex_review_resolved")
             self._dispatch_hook(
@@ -2302,7 +2470,7 @@ class OrchestratorService:
                     _now(),
                 ),
             )
-            test_run_id = int(cursor.lastrowid)
+            test_run_id = int(cursor.lastrowid or 0)
             self._audit(conn, actor, effective, "repo.test_run_recorded", "test_run", test_run_id, {"command_key": command_key, "exit_code": result.exit_code})
         return result
 
@@ -2488,7 +2656,7 @@ class OrchestratorService:
                     _now(),
                 ),
             )
-            session_id = int(cursor.lastrowid)
+            session_id = int(cursor.lastrowid or 0)
             self._audit(
                 conn,
                 actor,
@@ -3025,4 +3193,314 @@ class OrchestratorService:
                    ORDER BY id""",
                 (task_id, task_id, task_id, task_id, task_id),
             )
-        return [dict(item) for item in rows]
+        return [{**dict(row), "payload": _loads(str(row["payload_json"]))} for row in rows]
+
+    def get_orchestrator_status_snapshot(self, project_id: int | None = None) -> dict[str, Any]:
+        """Build a consistent, read-only status snapshot of projects, tasks, packages, and sessions."""
+        if project_id is not None:
+            projects_rows = self.store.fetchall("SELECT * FROM projects WHERE id = ? ORDER BY id", (project_id,))
+        else:
+            projects_rows = self.store.fetchall("SELECT * FROM projects ORDER BY id")
+
+        projects_out = []
+        for p_row in projects_rows:
+            p_dict = dict(p_row)
+            p_id = p_dict["id"]
+            tasks_rows = self.store.fetchall("SELECT id, title, status, created_at, updated_at FROM tasks WHERE project_id = ? ORDER BY id", (p_id,))
+            tasks_out = []
+            for t_row in tasks_rows:
+                t_dict = dict(t_row)
+                t_id = t_dict["id"]
+                pkgs_rows = self.store.fetchall("SELECT id, title, status, assigned_junior_agent, assigned_pro_agent, claimed_by_agent, updated_at FROM work_packages WHERE task_id = ? ORDER BY id", (t_id,))
+                pkgs_out = []
+                for pkg_row in pkgs_rows:
+                    pkg_dict = dict(pkg_row)
+                    pkg_id = pkg_dict["id"]
+                    sessions_rows = self.store.fetchall("SELECT id, assigned_agent, assigned_role, mode, lifecycle_state, pid, started_at, ended_at FROM mimo_sessions WHERE work_package_id = ? ORDER BY id DESC", (pkg_id,))
+                    pkg_dict["mimo_sessions"] = [dict(s) for s in sessions_rows]
+                    pkgs_out.append(pkg_dict)
+                t_dict["work_packages"] = pkgs_out
+                tasks_out.append(t_dict)
+            p_dict["tasks"] = tasks_out
+            projects_out.append(p_dict)
+
+        recent_audits = self.store.fetchall("SELECT * FROM audit_log ORDER BY id DESC LIMIT 10")
+        return {
+            "snapshot_timestamp": _now(),
+            "projects_count": len(projects_out),
+            "projects": projects_out,
+            "recent_audit_events": [dict(a) for a in recent_audits],
+        }
+
+    def get_task_summary(self, task_id: int) -> dict[str, Any]:
+        """Return a compact, structured summary of a task and its packages with recommended next_action."""
+        task = self._task(task_id)
+        pkgs_rows = self.store.fetchall("SELECT id, title, status FROM work_packages WHERE task_id = ? ORDER BY id", (task_id,))
+
+        active_ids = []
+        blocked_ids = []
+        accepted_count = 0
+        total_count = len(pkgs_rows)
+
+        pkgs_summary = []
+        for row in pkgs_rows:
+            p_dict = dict(row)
+            st = p_dict["status"]
+            pkgs_summary.append(p_dict)
+            if st == "GLM_ACCEPTED":
+                accepted_count += 1
+            if st in ACTIVE_WORK_PACKAGE_STATUSES:
+                active_ids.append(p_dict["id"])
+            if st in BLOCKED_WORK_PACKAGE_STATUSES:
+                blocked_ids.append(p_dict["id"])
+
+        next_act = project_next_action(task["status"], pkgs_summary)
+
+        return {
+            "id": task["id"],
+            "project_id": task["project_id"],
+            "title": task["title"],
+            "status": task["status"],
+            "package_counts": {
+                "total": total_count,
+                "accepted": accepted_count,
+                "active": len(active_ids),
+                "blocked": len(blocked_ids),
+            },
+            "active_package_ids": active_ids,
+            "blocked_package_ids": blocked_ids,
+            "next_action": next_act,
+        }
+
+    def get_work_package_summary(self, package_id: int) -> dict[str, Any]:
+        """Return a compact summary of a work package."""
+        pkg = self._package(package_id)
+        sessions_rows = self.store.fetchall(
+            "SELECT id, assigned_agent, assigned_role, mode, lifecycle_state, pid FROM mimo_sessions WHERE work_package_id = ? ORDER BY id DESC LIMIT 5",
+            (package_id,),
+        )
+        return {
+            "id": pkg["id"],
+            "task_id": pkg["task_id"],
+            "title": pkg["title"],
+            "status": pkg["status"],
+            "assigned_junior_agent": pkg["assigned_junior_agent"],
+            "assigned_pro_agent": pkg["assigned_pro_agent"],
+            "claimed_by_agent": pkg["claimed_by_agent"],
+            "recent_sessions": [dict(s) for s in sessions_rows],
+            "updated_at": pkg["updated_at"],
+        }
+
+    def list_handoff_events_page(self, work_package_id: int, after_event_id: int = 0, limit: int = 20) -> dict[str, Any]:
+        """Paginated event retrieval for work package handoffs."""
+        clamped_limit = max(1, min(limit, 200))
+        package = self._package(work_package_id)
+        task = self._task(package["task_id"])
+        _, events_path, _ = self._handoff_paths(task["project_id"], task["id"], work_package_id)
+
+        if not events_path.is_file():
+            return {
+                "items": [],
+                "has_more": False,
+                "next_after_id": None,
+                "limit": clamped_limit,
+            }
+
+        all_events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+        filtered = []
+        for idx, evt in enumerate(all_events, start=1):
+            evt_id = evt.get("event_id", idx)
+            if isinstance(evt_id, int) and evt_id > after_event_id:
+                filtered.append(evt)
+            elif idx > after_event_id:
+                filtered.append(evt)
+
+        has_more = len(filtered) > clamped_limit
+        items = filtered[:clamped_limit]
+        next_after_id = after_event_id + len(items) if items else None
+
+        return {
+            "items": items,
+            "has_more": has_more,
+            "next_after_id": next_after_id,
+            "limit": clamped_limit,
+        }
+
+    def list_audit_page(self, task_id: int | None = None, after_audit_id: int = 0, limit: int = 20) -> dict[str, Any]:
+        """Paginated audit log retrieval."""
+        clamped_limit = max(1, min(limit, 200))
+        if task_id is None:
+            rows = self.store.fetchall(
+                "SELECT * FROM audit_log WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (after_audit_id, clamped_limit + 1),
+            )
+        else:
+            rows = self.store.fetchall(
+                """SELECT * FROM audit_log WHERE id > ? AND (
+                     (target_type = 'task' AND target_id = ?)
+                     OR target_id IN (SELECT id FROM work_packages WHERE task_id = ?)
+                     OR target_id IN (SELECT id FROM submissions WHERE work_package_id IN (SELECT id FROM work_packages WHERE task_id = ?))
+                     OR target_id IN (SELECT id FROM reviews WHERE target_type = 'task' AND target_id = ?)
+                     OR target_id IN (SELECT id FROM mimo_sessions WHERE task_id = ?)
+                   ) ORDER BY id ASC LIMIT ?""",
+                (after_audit_id, task_id, task_id, task_id, task_id, task_id, clamped_limit + 1),
+            )
+
+        has_more = len(rows) > clamped_limit
+        items_rows = rows[:clamped_limit]
+        items = [{**dict(row), "payload": _loads(str(row["payload_json"]))} for row in items_rows]
+        next_after_id = items[-1]["id"] if items else None
+        return {
+            "items": items,
+            "has_more": has_more,
+            "next_after_id": next_after_id,
+            "limit": clamped_limit,
+        }
+
+    def ack_continuation(
+        self,
+        actor: ActorIdentity,
+        continuation_id: str,
+        source_event_id: str,
+        controller_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Idempotently acknowledge adoption of a continuation by a revived controller."""
+        if actor.primary_role not in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
+            raise OrchestratorError("Only USER or CODEX may acknowledge continuations")
+
+        with self.store.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM continuation_deliveries WHERE continuation_id = ?",
+                (continuation_id,),
+            ).fetchone()
+            if row is None:
+                raise OrchestratorError(f"Continuation delivery not found: {continuation_id}")
+
+            deliv = dict(row)
+            if deliv["source_event_id"] != source_event_id:
+                raise OrchestratorError(f"Continuation source event mismatch for {continuation_id}")
+
+            if deliv["state"] in {"ACKNOWLEDGED", "RESOLVED"}:
+                return deliv
+
+            timestamp = _now()
+            conn.execute(
+                """UPDATE continuation_deliveries 
+                   SET state = ?, acknowledged_at = ?, controller_session_id = ? 
+                   WHERE continuation_id = ?""",
+                ("ACKNOWLEDGED", timestamp, controller_session_id, continuation_id),
+            )
+            self._audit(
+                conn,
+                actor,
+                actor.primary_role,
+                "CONTINUATION_ACKNOWLEDGED",
+                "continuation",
+                deliv["id"],
+                {"continuation_id": continuation_id, "source_event_id": source_event_id},
+            )
+            return dict(conn.execute("SELECT * FROM continuation_deliveries WHERE continuation_id = ?", (continuation_id,)).fetchone())
+
+    def resolve_continuation(
+        self,
+        actor: ActorIdentity,
+        continuation_id: str,
+        source_event_id: str,
+        resolution_notes: str = "",
+    ) -> dict[str, Any]:
+        """Resolve a continuation delivery after successful action or terminal outcome."""
+        if actor.primary_role not in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
+            raise OrchestratorError("Only USER or CODEX may resolve continuations")
+
+        with self.store.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM continuation_deliveries WHERE continuation_id = ?",
+                (continuation_id,),
+            ).fetchone()
+            if row is None:
+                raise OrchestratorError(f"Continuation delivery not found: {continuation_id}")
+
+            deliv = dict(row)
+            if deliv["source_event_id"] != source_event_id:
+                raise OrchestratorError(f"Continuation source event mismatch for {continuation_id}")
+
+            if deliv["state"] == "RESOLVED":
+                return deliv
+
+            timestamp = _now()
+            conn.execute(
+                """UPDATE continuation_deliveries 
+                   SET state = ?, resolved_at = ? 
+                   WHERE continuation_id = ?""",
+                ("RESOLVED", timestamp, continuation_id),
+            )
+            self._audit(
+                conn,
+                actor,
+                actor.primary_role,
+                "CONTINUATION_RESOLVED",
+                "continuation",
+                deliv["id"],
+                {"continuation_id": continuation_id, "notes": resolution_notes},
+            )
+            return dict(conn.execute("SELECT * FROM continuation_deliveries WHERE continuation_id = ?", (continuation_id,)).fetchone())
+
+    def get_continuation(self, continuation_id: str) -> dict[str, Any]:
+        """Fetch details of a continuation delivery record."""
+        row = self.store.fetchone("SELECT * FROM continuation_deliveries WHERE continuation_id = ?", (continuation_id,))
+        if row is None:
+            raise OrchestratorError(f"Continuation delivery not found: {continuation_id}")
+        return dict(row)
+
+    def requeue_dead_letter_continuation(
+        self,
+        actor: ActorIdentity,
+        continuation_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Manually requeue a dead-lettered continuation back to PENDING state."""
+        if actor.primary_role not in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
+            raise OrchestratorError("Only USER or CODEX may requeue dead-lettered continuations")
+        if not reason or len(reason.strip()) < 10:
+            raise OrchestratorError("Requeuing dead-lettered continuation requires a descriptive reason (>= 10 chars)")
+
+        with self.store.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM continuation_deliveries WHERE continuation_id = ?",
+                (continuation_id,),
+            ).fetchone()
+            if row is None:
+                raise OrchestratorError(f"Continuation delivery not found: {continuation_id}")
+
+            deliv = dict(row)
+            if deliv["state"] != "DEAD_LETTER":
+                raise OrchestratorError(f"Continuation {continuation_id} is in state '{deliv['state']}', not DEAD_LETTER")
+
+            timestamp = _now()
+            conn.execute(
+                """UPDATE continuation_deliveries 
+                   SET state = ?, attempt_count = 0, next_attempt_at = ?, last_error = ? 
+                   WHERE continuation_id = ?""",
+                ("PENDING", timestamp, f"Requeued by {actor.name}: {reason}", continuation_id),
+            )
+            self._audit(
+                conn,
+                actor,
+                actor.primary_role,
+                "CONTINUATION_REQUEUED",
+                "continuation",
+                deliv["id"],
+                {"continuation_id": continuation_id, "reason": reason},
+            )
+            return dict(conn.execute("SELECT * FROM continuation_deliveries WHERE continuation_id = ?", (continuation_id,)).fetchone())
+
+    def close(self) -> None:
+        """Close the underlying ledger store connection."""
+        self.store.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass

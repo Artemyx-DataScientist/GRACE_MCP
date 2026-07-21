@@ -33,7 +33,7 @@
 
 from __future__ import annotations
 
-import fnmatch
+from hashlib import sha256
 import json
 import re
 from pathlib import Path
@@ -594,3 +594,172 @@ def lint_agent_infra(repo_root: Path) -> dict[str, Any]:
                     issues.append(f"Suspicious hidden-comment pattern in {rel_path}: {pattern}")
 
     return _result("pass" if not issues else "blocked", issues, warnings)
+
+
+def calculate_rejection_fingerprint(rejection_reasons: Sequence[str]) -> str:
+    """Produce a stable hash fingerprint for rejection reasons."""
+    cleaned = [str(r).strip() for r in rejection_reasons if str(r).strip()]
+    if not cleaned:
+        return ""
+    joined = "\n".join(sorted(cleaned))
+    return sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def create_compact_log_projection(
+    full_log: str,
+    artifact_ref: str = "",
+    sha256_hash: str = "",
+    head_lines: int = 20,
+    tail_lines: int = 30,
+) -> str:
+    """Build a non-destructive compact LLM projection of a test or execution log."""
+    if not full_log:
+        return full_log
+
+    lines = full_log.splitlines()
+    total_lines = len(lines)
+
+    if total_lines <= (head_lines + tail_lines):
+        return full_log
+
+    head = lines[:head_lines]
+    tail = lines[-tail_lines:]
+    middle = lines[head_lines:-tail_lines]
+
+    diagnostic_patterns = ("traceback", "caused by", "error", "failed", "panic", "exception", "assert")
+    matched_diagnostics = [
+        line for line in middle
+        if any(pat in line.lower() for pat in diagnostic_patterns)
+    ]
+    omitted_count = total_lines - (head_lines + tail_lines)
+
+    parts = [
+        f"--- BEGIN OUTPUT: first {head_lines} of {total_lines} lines ---",
+        "\n".join(head),
+        f"--- OMITTED {omitted_count} LINES ---",
+    ]
+
+    if matched_diagnostics:
+        parts.extend([
+            f"--- EXTRACTED DIAGNOSTICS ({len(matched_diagnostics)} matched lines) ---",
+            "\n".join(matched_diagnostics[:50]),
+        ])
+
+    parts.extend([
+        f"--- END OUTPUT: last {tail_lines} lines ---",
+        "\n".join(tail),
+    ])
+
+    if artifact_ref:
+        parts.append(f"--- FULL LOG ARTIFACT: {artifact_ref} (SHA-256: {sha256_hash}) ---")
+
+    return "\n".join(parts)
+
+
+def create_compact_diff_projection(
+    files_changed: Sequence[str],
+    diff_text: str,
+    artifact_ref: str = "",
+    sha256_hash: str = "",
+) -> str:
+    """Build a non-destructive compact LLM projection of a code diff."""
+    adds = sum(1 for line in diff_text.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    dels = sum(1 for line in diff_text.splitlines() if line.startswith("-") and not line.startswith("---"))
+    hunks = sum(1 for line in diff_text.splitlines() if line.startswith("@@"))
+
+    summary_lines = [
+        "--- COMPACT DIFF SUMMARY ---",
+        f"Files Changed ({len(files_changed)}): " + ", ".join(files_changed),
+        f"Stats: +{adds} / -{dels} lines across {hunks} hunks.",
+    ]
+    if artifact_ref:
+        summary_lines.append(f"--- FULL DIFF ARTIFACT: {artifact_ref} (SHA-256: {sha256_hash}) ---")
+
+    return "\n".join(summary_lines)
+
+
+def compact_worker_report_for_context(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Pure projection helper returning a compact version of a worker report for LLM prompt context."""
+    compacted = dict(report)
+    commands_run = compacted.get("commands run with exact results")
+    if isinstance(commands_run, Sequence) and not isinstance(commands_run, (str, bytes)):
+        compacted_cmds = []
+        for cmd in commands_run:
+            if isinstance(cmd, Mapping):
+                cmd_dict = dict(cmd)
+                out = cmd_dict.get("stdout") or cmd_dict.get("output")
+                if isinstance(out, str) and len(out.splitlines()) > 50:
+                    cmd_dict["output"] = create_compact_log_projection(out)
+                compacted_cmds.append(cmd_dict)
+            else:
+                compacted_cmds.append(cmd)
+        compacted["commands run with exact results"] = compacted_cmds
+    return compacted
+
+
+ACTIVE_WORK_PACKAGE_STATUSES = frozenset({
+    "CREATED",
+    "ASSIGNED",
+    "CLAIMED_JUNIOR",
+    "CLAIMED_PRO",
+    "SUBMITTED",
+    "GLM_REVIEW_IN_PROGRESS",
+    "REPAIR_REQUIRED",
+})
+
+BLOCKED_WORK_PACKAGE_STATUSES = frozenset({
+    "HUMAN_INTERVENTION_REQUIRED",
+    "BLOCKED",
+})
+
+TERMINAL_WORK_PACKAGE_STATUSES = frozenset({
+    "GLM_ACCEPTED",
+    "CANCELLED",
+})
+
+
+def project_next_action(
+    task_status: str,
+    packages: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, str]:
+    """Pure classifier projecting the next recommended action for a task and its packages."""
+    if task_status == "CODEX_TASK_CREATED":
+        return {"role": "glm", "action": "task.plan"}
+    if task_status == "GLM_GRACE_PLANNED":
+        return {"role": "glm", "action": "verification.register_plan or submission.controller_task_completion"}
+    if task_status == "GLM_TESTS_PREPARED":
+        return {"role": "glm", "action": "workpackage.create or submission.controller_task_completion"}
+
+    pkgs = list(packages or [])
+
+    # Check for blocked packages
+    for pkg in pkgs:
+        st = str(pkg.get("status", ""))
+        if st in BLOCKED_WORK_PACKAGE_STATUSES:
+            return {"role": "user_or_codex", "action": f"workpackage.force_reset or task.force_transition for package #{pkg.get('id')}"}
+
+    # Check active package states
+    for pkg in pkgs:
+        st = str(pkg.get("status", ""))
+        if st == "CREATED":
+            return {"role": "glm", "action": f"workpackage.assign for package #{pkg.get('id')}"}
+        if st in {"ASSIGNED", "REPAIR_REQUIRED"}:
+            return {"role": "worker_junior_or_pro", "action": f"workpackage.claim for package #{pkg.get('id')}"}
+        if st in {"CLAIMED_JUNIOR", "CLAIMED_PRO"}:
+            return {"role": "worker_junior_or_pro", "action": f"submission.create for package #{pkg.get('id')}"}
+        if st in {"SUBMITTED", "GLM_REVIEW_IN_PROGRESS"}:
+            return {"role": "glm", "action": f"review.glm_submit for package #{pkg.get('id')}"}
+
+    if task_status in {"WORK_PACKAGES_CREATED", "WORK_PACKAGES_ASSIGNED"}:
+        if pkgs and all(str(p.get("status", "")) == "GLM_ACCEPTED" for p in pkgs):
+            return {"role": "codex", "action": "task.request_final_review"}
+        return {"role": "glm", "action": "workpackage.assign or review.glm_submit"}
+
+    if task_status == "CODEX_FINAL_REVIEW":
+        return {"role": "codex", "action": "review.codex_submit"}
+    if task_status == "CODEX_ACCEPTED":
+        return {"role": "codex", "action": "task.close"}
+    if task_status == "CLOSED":
+        return {"role": "none", "action": "none"}
+
+    return {"role": "codex", "action": "task.get"}

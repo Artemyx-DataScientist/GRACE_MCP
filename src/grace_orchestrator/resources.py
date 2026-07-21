@@ -23,8 +23,11 @@ from __future__ import annotations
 
 RESOURCE_URIS = {
     "orchestrator://project/{project_id}",
+    "orchestrator://project/{project_id}/active",
     "orchestrator://task/{task_id}",
+    "orchestrator://task/{task_id}/summary",
     "orchestrator://workpackage/{work_package_id}",
+    "orchestrator://workpackage/{work_package_id}/summary",
     "orchestrator://submission/{submission_id}",
     "orchestrator://review/{review_id}",
     "orchestrator://mimo-session/{session_id}",

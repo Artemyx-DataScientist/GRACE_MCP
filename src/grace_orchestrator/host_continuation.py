@@ -35,9 +35,11 @@ import subprocess
 import sys
 import time
 from typing import Any, Mapping, Sequence
+import uuid
 
 from .models import stable_hash
 from .db import OrchestratorStore
+from .process_identity import ProcessIdentity, ProcessMatchState, verify_process_liveness
 
 TRIGGER_EVENT_TYPES = frozenset(
     {
@@ -92,10 +94,22 @@ def _write_durable_text(path: Path, content: str) -> None:
         os.fsync(stream.fileno())
 
 
+def _event_identity(run_id: str, line_index: int, event: dict[str, Any]) -> str:
+    raw_id = str(event.get("event_id") or "").strip()
+    if raw_id:
+        return raw_id
+    canonical_payload = json.dumps(event, sort_keys=True)
+    hash_sig = stable_hash(f"{run_id}_{line_index}_{canonical_payload}")[:16]
+    return f"legacy_evt_{hash_sig}"
+
+
 def _append_ndjson(path: Path, event: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    evt_dict = dict(event)
+    if "event_id" not in evt_dict or not str(evt_dict["event_id"]).strip():
+        evt_dict["event_id"] = str(uuid.uuid4())
     with path.open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(dict(event), sort_keys=True) + "\n")
+        stream.write(json.dumps(evt_dict, sort_keys=True) + "\n")
         stream.flush()
         os.fsync(stream.fileno())
 
@@ -182,6 +196,7 @@ class HostContinuationSupervisor:
         self.cursor_path = self.state_dir / "cursor.json"
         self.lock_root = self.state_dir / "locks"
         self.prompt_root = self.state_dir / "prompts"
+        self._last_spawned_pid: int | None = None
 
     def run_forever(self) -> None:
         """Poll durable run events until the host process is stopped."""
@@ -221,7 +236,7 @@ class HostContinuationSupervisor:
                     locked.append({"status": "locked", "run_id": location.run_id, "event_index": event_index})
                     break
 
-                source_event_id = str(event.get("event_id") or f"evt_{location.run_id}_{event_index}")
+                source_event_id = _event_identity(location.run_id, event_index, event)
                 continuation_id = f"cont_{stable_hash(location.run_id + '_' + source_event_id)[:16]}"
 
                 self._enqueue_continuation_delivery(
@@ -279,6 +294,10 @@ class HostContinuationSupervisor:
         worker_id = str(trigger_event.get("worker") or package.get("claimed_by_agent") or package.get("assigned_junior_agent") or "")
         return {
             "run_id": location.run_id,
+            "continuation_id": trigger_event.get("continuation_id"),
+            "source_event_id": trigger_event.get("source_event_id"),
+            "attempt_id": trigger_event.get("attempt_id"),
+            "attempt_count": trigger_event.get("attempt_count", 1),
             "project_id": project_id,
             "task_id": task_id,
             "work_package_id": package_id,
@@ -328,6 +347,12 @@ class HostContinuationSupervisor:
             "",
             "Continue GRACE controller review for the durable worker handoff below.",
             "This is host-level continuation outside `handoff.wait_for_event`; do not assume the previous controller session is alive.",
+            "",
+            "## Continuation ACK Keys",
+            f"- continuation_id: {context.get('continuation_id')}",
+            f"- source_event_id: {context.get('source_event_id')}",
+            f"- attempt_id: {context.get('attempt_id')}",
+            f"- attempt_count: {context.get('attempt_count')}",
             "",
             "## Durable run",
             f"- Run id: {context.get('run_id')}",
@@ -410,9 +435,91 @@ class HostContinuationSupervisor:
             )
             return True
 
+    def _recover_expired_leases(self, store: OrchestratorStore) -> list[dict[str, Any]]:
+        recovered = []
+        now_dt = datetime.now(UTC)
+        now_str = _now()
+
+        with store.transaction() as conn:
+            # 1. Recover expired CLAIMED leases (supervisor crashed before Popen)
+            claimed_expired = conn.execute(
+                """SELECT * FROM continuation_deliveries 
+                   WHERE state = 'CLAIMED' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?""",
+                (now_str,),
+            ).fetchall()
+
+            for row in claimed_expired:
+                deliv = dict(row)
+                attempts = int(deliv["attempt_count"])
+                if attempts >= 3:
+                    conn.execute(
+                        "UPDATE continuation_deliveries SET state = 'DEAD_LETTER', last_error = ? WHERE continuation_id = ?",
+                        ("Exceeded maximum attempt limit (3) during CLAIMED lease recovery", deliv["continuation_id"]),
+                    )
+                    recovered.append({"continuation_id": deliv["continuation_id"], "status": "dead_lettered_claimed_lease"})
+                else:
+                    backoff_sec = 5 if attempts <= 1 else (30 if attempts == 2 else 120)
+                    next_retry = datetime.fromtimestamp(now_dt.timestamp() + backoff_sec, UTC).isoformat()
+                    conn.execute(
+                        """UPDATE continuation_deliveries 
+                           SET state = 'RETRY_WAIT', next_attempt_at = ?, last_error = ? 
+                           WHERE continuation_id = ?""",
+                        (next_retry, "Claim lease expired before controller launch", deliv["continuation_id"]),
+                    )
+                    recovered.append({"continuation_id": deliv["continuation_id"], "status": "retry_claimed_lease"})
+
+            # 2. Recover expired CONTROLLER_STARTED leases (controller unacknowledged timeout)
+            started_expired = conn.execute(
+                """SELECT * FROM continuation_deliveries 
+                   WHERE state = 'CONTROLLER_STARTED' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?""",
+                (now_str,),
+            ).fetchall()
+
+            for row in started_expired:
+                deliv = dict(row)
+                pid = deliv.get("controller_pid")
+                attempts = int(deliv["attempt_count"])
+
+                # Tri-state process liveness check
+                is_alive = False
+                if pid:
+                    ident = ProcessIdentity(pid=int(pid), process_started_at_os="UNKNOWN", executable_path="", argv_hash="", launch_nonce="")
+                    match_state = verify_process_liveness(ident)
+                    if match_state == ProcessMatchState.MATCH:
+                        is_alive = True
+
+                if is_alive:
+                    new_lease = datetime.fromtimestamp(now_dt.timestamp() + 300, UTC).isoformat()
+                    conn.execute(
+                        "UPDATE continuation_deliveries SET lease_expires_at = ? WHERE continuation_id = ?",
+                        (new_lease, deliv["continuation_id"]),
+                    )
+                    recovered.append({"continuation_id": deliv["continuation_id"], "status": "lease_extended"})
+                else:
+                    if attempts >= 3:
+                        conn.execute(
+                            "UPDATE continuation_deliveries SET state = 'DEAD_LETTER', last_error = ? WHERE continuation_id = ?",
+                            ("Exceeded maximum attempt limit (3) without controller ACK", deliv["continuation_id"]),
+                        )
+                        recovered.append({"continuation_id": deliv["continuation_id"], "status": "dead_lettered_unacked"})
+                    else:
+                        backoff_sec = 5 if attempts <= 1 else (30 if attempts == 2 else 120)
+                        next_retry = datetime.fromtimestamp(now_dt.timestamp() + backoff_sec, UTC).isoformat()
+                        conn.execute(
+                            """UPDATE continuation_deliveries 
+                               SET state = 'RETRY_WAIT', next_attempt_at = ?, last_error = ? 
+                               WHERE continuation_id = ?""",
+                            (next_retry, "Controller exited or unacknowledged lease expired", deliv["continuation_id"]),
+                        )
+                        recovered.append({"continuation_id": deliv["continuation_id"], "status": "retry_unacked"})
+
+        return recovered
+
     def _process_pending_deliveries(self) -> list[dict[str, Any]]:
         db_path = self.data_dir / "ledger.sqlite3"
         store = OrchestratorStore(db_path)
+
+        self._recover_expired_leases(store)
 
         results = []
         now_str = _now()
@@ -423,47 +530,73 @@ class HostContinuationSupervisor:
                    ORDER BY id ASC LIMIT 10""",
                 (now_str,),
             ).fetchall()
+            pending_deliveries = [dict(row) for row in pending]
 
-            for row in pending:
-                deliv = dict(row)
-                res = self._dispatch_delivery(conn, deliv)
-                results.append(res)
+        for deliv in pending_deliveries:
+            res = self._dispatch_delivery(store, deliv)
+            results.append(res)
 
         return results
 
-    def _dispatch_delivery(self, conn: sqlite3.Connection, delivery: dict[str, Any]) -> dict[str, Any]:
+    def _dispatch_delivery(self, store: OrchestratorStore, delivery: dict[str, Any]) -> dict[str, Any]:
         continuation_id = delivery["continuation_id"]
         run_id = delivery["run_id"]
         attempts = int(delivery["attempt_count"]) + 1
 
         if attempts > 3:
-            conn.execute(
-                "UPDATE continuation_deliveries SET state = ?, last_error = ? WHERE continuation_id = ?",
-                ("DEAD_LETTER", "Exceeded maximum attempt limit (3)", continuation_id),
-            )
+            with store.transaction() as conn:
+                conn.execute(
+                    "UPDATE continuation_deliveries SET state = ?, last_error = ? WHERE continuation_id = ?",
+                    ("DEAD_LETTER", "Exceeded maximum attempt limit (3)", continuation_id),
+                )
             return {"continuation_id": continuation_id, "status": "dead_lettered"}
 
+        now_dt = datetime.now(UTC)
+        now_str = now_dt.isoformat()
+        claim_lease = datetime.fromtimestamp(now_dt.timestamp() + 60, UTC).isoformat()
+        attempt_id = f"att_{uuid.uuid4().hex[:16]}"
+
+        # STEP 1: Short claim transaction
+        with store.transaction() as conn:
+            cursor = conn.execute(
+                """UPDATE continuation_deliveries 
+                   SET state = 'CLAIMED', attempt_id = ?, claimed_by = ?, lease_expires_at = ?, attempt_count = ?
+                   WHERE continuation_id = ? AND (state = 'PENDING' OR (state = 'RETRY_WAIT' AND next_attempt_at <= ?))""",
+                (attempt_id, f"supervisor_{os.getpid()}", claim_lease, attempts, continuation_id, now_str),
+            )
+            if cursor.rowcount == 0:
+                return {"continuation_id": continuation_id, "status": "already_claimed"}
+
+        # STEP 2: File reading and prompt preparation OUTSIDE transaction
         events_path = self.data_dir / "runs" / run_id / "events.ndjson"
         if not events_path.is_file():
             events_path = self.data_dir / run_id / "events.ndjson"
         if not events_path.is_file():
+            with store.transaction() as conn:
+                conn.execute(
+                    "UPDATE continuation_deliveries SET state = 'RETRY_WAIT', last_error = ? WHERE continuation_id = ?",
+                    ("Events log file missing", continuation_id),
+                )
             return {"continuation_id": continuation_id, "status": "events_path_missing"}
 
         all_events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         trigger_event = None
         event_idx = 0
-        for idx, evt in enumerate(all_events):
-            evt_id = str(evt.get("event_id") or f"evt_{run_id}_{idx}")
+        for idx, evt in enumerate(all_events, start=1):
+            if not isinstance(evt, dict):
+                continue
+            evt_id = _event_identity(run_id, idx, evt)
             if evt_id == delivery["source_event_id"]:
                 trigger_event = evt
                 event_idx = idx
                 break
 
-        if trigger_event is None and all_events:
-            trigger_event = all_events[-1]
-            event_idx = len(all_events) - 1
-
         if trigger_event is None:
+            with store.transaction() as conn:
+                conn.execute(
+                    "UPDATE continuation_deliveries SET state = 'RETRY_WAIT', last_error = ? WHERE continuation_id = ?",
+                    (f"Source event {delivery['source_event_id']} not found in events log", continuation_id),
+                )
             return {"continuation_id": continuation_id, "status": "no_trigger_event"}
 
         location = EventLocation(events_path, event_idx, events_path.parent, run_id)
@@ -473,7 +606,13 @@ class HostContinuationSupervisor:
             return {"continuation_id": continuation_id, "status": "locked"}
 
         try:
-            context = self.build_run_context(location, trigger_event)
+            enriched_trigger = dict(trigger_event)
+            enriched_trigger["continuation_id"] = continuation_id
+            enriched_trigger["source_event_id"] = delivery["source_event_id"]
+            enriched_trigger["attempt_id"] = attempt_id
+            enriched_trigger["attempt_count"] = attempts
+
+            context = self.build_run_context(location, enriched_trigger)
             prompt_path = self._write_prompt(context)
 
             self._append_host_event(
@@ -483,30 +622,35 @@ class HostContinuationSupervisor:
                     "prompt_path": str(prompt_path),
                     "trigger_event_type": context["trigger_event_type"],
                     "event_index": location.event_index,
+                    "attempt_id": attempt_id,
                 },
             )
 
             resumed = self._attempt_resume(context, prompt_path)
             logical = False if resumed else self._attempt_logical_start(context, prompt_path)
+            spawn_pid = self._last_spawned_pid
 
-            if resumed or logical:
-                conn.execute(
-                    """UPDATE continuation_deliveries 
-                       SET state = ?, attempt_count = ?, controller_pid = ? 
-                       WHERE continuation_id = ?""",
-                    ("CONTROLLER_STARTED", attempts, os.getpid(), continuation_id),
-                )
-                return {"continuation_id": continuation_id, "status": "started", "attempts": attempts}
-            else:
-                backoff_sec = 5 if attempts == 1 else (30 if attempts == 2 else 120)
-                next_retry = datetime.fromtimestamp(datetime.now(UTC).timestamp() + backoff_sec, UTC).isoformat()
-                conn.execute(
-                    """UPDATE continuation_deliveries 
-                       SET state = ?, attempt_count = ?, next_attempt_at = ?, last_error = ? 
-                       WHERE continuation_id = ?""",
-                    ("RETRY_WAIT", attempts, next_retry, "Controller command failed to start", continuation_id),
-                )
-                return {"continuation_id": continuation_id, "status": "retry_scheduled", "attempts": attempts}
+            # STEP 3: Short update transaction after Popen
+            with store.transaction() as conn:
+                if resumed or logical:
+                    ack_lease = datetime.fromtimestamp(datetime.now(UTC).timestamp() + 300, UTC).isoformat()
+                    conn.execute(
+                        """UPDATE continuation_deliveries 
+                           SET state = 'CONTROLLER_STARTED', lease_expires_at = ?, controller_pid = ? 
+                           WHERE continuation_id = ? AND attempt_id = ?""",
+                        (ack_lease, spawn_pid, continuation_id, attempt_id),
+                    )
+                    return {"continuation_id": continuation_id, "attempt_id": attempt_id, "status": "started", "attempts": attempts, "pid": spawn_pid}
+                else:
+                    backoff_sec = 5 if attempts == 1 else (30 if attempts == 2 else 120)
+                    next_retry = datetime.fromtimestamp(datetime.now(UTC).timestamp() + backoff_sec, UTC).isoformat()
+                    conn.execute(
+                        """UPDATE continuation_deliveries 
+                           SET state = 'RETRY_WAIT', next_attempt_at = ?, last_error = ? 
+                           WHERE continuation_id = ? AND attempt_id = ?""",
+                        (next_retry, "Controller command failed to start", continuation_id, attempt_id),
+                    )
+                    return {"continuation_id": continuation_id, "attempt_id": attempt_id, "status": "retry_scheduled", "attempts": attempts}
         finally:
             self._release_lock(lock_path)
 
@@ -532,6 +676,7 @@ class HostContinuationSupervisor:
             return False
         result = self._launch_configured_command("resume", self.config.resume_command, context, prompt_path)
         if result["ok"]:
+            self._last_spawned_pid = result.get("pid")
             self._append_host_event(context, "HOST_CONTROLLER_RESUME_STARTED", result)
             return True
         self._append_host_event(context, "HOST_CONTROLLER_RESUME_FAILED", result)
@@ -550,6 +695,7 @@ class HostContinuationSupervisor:
             return False
         result = self._launch_configured_command("logical", self.config.start_command, context, prompt_path)
         if result["ok"]:
+            self._last_spawned_pid = result.get("pid")
             self._append_host_event(context, "HOST_CONTROLLER_LOGICAL_CONTINUATION_STARTED", result)
             return True
         self._append_host_event(context, "HOST_CONTROLLER_RESUME_FAILED", result)
@@ -568,6 +714,9 @@ class HostContinuationSupervisor:
             "prompt": prompt_text,
             "data_dir": str(self.data_dir),
             "run_id": str(context.get("run_id") or ""),
+            "continuation_id": str(context.get("continuation_id") or ""),
+            "source_event_id": str(context.get("source_event_id") or ""),
+            "attempt_id": str(context.get("attempt_id") or ""),
             "task_id": str(context.get("task_id") or ""),
             "work_package_id": str(context.get("work_package_id") or ""),
             "report_path": str(context.get("handoff_report_path") or ""),
@@ -591,6 +740,11 @@ class HostContinuationSupervisor:
                 "GRACE_CONTROLLER_CONTINUATION_MODE": mode,
                 "GRACE_CONTROLLER_CONTINUATION_PROMPT_FILE": str(prompt_path),
                 "GRACE_CONTROLLER_CONTINUATION_RUN_ID": str(context.get("run_id") or ""),
+                "GRACE_CONTINUATION_ID": str(context.get("continuation_id") or ""),
+                "GRACE_CONTINUATION_SOURCE_EVENT_ID": str(context.get("source_event_id") or ""),
+                "GRACE_CONTINUATION_ATTEMPT_ID": str(context.get("attempt_id") or ""),
+                "GRACE_CONTINUATION_RUN_ID": str(context.get("run_id") or ""),
+                "GRACE_CONTINUATION_ATTEMPT": str(context.get("attempt_count") or "1"),
                 "GRACE_CONTROLLER_CONTINUATION_TASK_ID": str(context.get("task_id") or ""),
                 "GRACE_CONTROLLER_CONTINUATION_WORK_PACKAGE_ID": str(context.get("work_package_id") or ""),
                 "GRACE_CONTROLLER_CONTINUATION_REPORT_PATH": str(context.get("handoff_report_path") or ""),
@@ -656,14 +810,22 @@ class HostContinuationSupervisor:
 
     def _read_events(self, events_path: Path, after_index: int) -> list[tuple[int, dict[str, Any]]]:
         events: list[tuple[int, dict[str, Any]]] = []
+        try:
+            run_id = _relative_key(self.data_dir / "runs", events_path.parent)
+        except Exception:
+            run_id = events_path.parent.name
         for event_index, line in enumerate(events_path.read_text(encoding="utf-8").splitlines(), start=1):
             if event_index <= after_index or not line.strip():
                 continue
             try:
                 decoded = json.loads(line)
+                if isinstance(decoded, dict):
+                    decoded["event_id"] = _event_identity(run_id, event_index, decoded)
+                else:
+                    decoded = {"type": "INVALID_EVENT_JSON", "event_id": f"evt_{run_id}_{event_index}"}
             except json.JSONDecodeError:
-                decoded = {"type": "INVALID_EVENT_JSON", "raw": line}
-            events.append((event_index, decoded if isinstance(decoded, dict) else {"type": "INVALID_EVENT_JSON"}))
+                decoded = {"type": "INVALID_EVENT_JSON", "event_id": f"evt_{run_id}_{event_index}", "raw": line}
+            events.append((event_index, decoded))
         return events
 
     def _location_for(self, events_path: Path, event_index: int) -> EventLocation:

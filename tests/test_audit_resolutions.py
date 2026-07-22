@@ -155,6 +155,13 @@ def test_handoff_event_uuid_generation_and_pagination(tmp_path: Path) -> None:
     )
 
     glm_actor = ActorIdentity(name="glm_planner", primary_role=OrchestratorRole.GLM)
+    service.register_agent(
+        actor=actor,
+        project_id=1,
+        name=glm_actor.name,
+        primary_role=OrchestratorRole.GLM,
+        capabilities=[OrchestratorRole.GLM],
+    )
     service.plan_task(actor=glm_actor, task_id=1)
     service.register_verification_plan(
         actor=glm_actor,

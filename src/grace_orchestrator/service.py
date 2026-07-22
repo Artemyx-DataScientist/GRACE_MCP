@@ -64,7 +64,6 @@ from .models import (
     WorkPackageStatus,
     stable_hash,
 )
-from .permissions import authorize_role
 from .policy import (
     ACTIVE_WORK_PACKAGE_STATUSES,
     BLOCKED_WORK_PACKAGE_STATUSES,
@@ -353,7 +352,26 @@ class OrchestratorService:
             if self._is_registered_in_project(actor.name, project_id):
                 return required_role
 
-        return authorize_role(actor, required_role, self._delegations(project_id, task_id))
+        now = datetime.now(UTC)
+        delegations = self._delegations(project_id, task_id)
+        for delegation in delegations:
+            if delegation.get("substitute_actor") == actor.name:
+                if delegation.get("delegated_role") == required_role.value:
+                    if delegation.get("revoked_at") is None:
+                        expires_at = delegation.get("expires_at")
+                        if isinstance(expires_at, str):
+                            try:
+                                expiry = datetime.fromisoformat(expires_at)
+                                if expiry.tzinfo is None:
+                                    expiry = expiry.replace(tzinfo=UTC)
+                                if expiry > now:
+                                    return required_role
+                            except ValueError:
+                                pass
+
+        raise OrchestratorError(
+            f"Actor {actor.name!r} is not authorized for role {required_role.value} on project {project_id}"
+        )
 
     def _is_authorized_for_project(
         self,
@@ -2006,6 +2024,26 @@ class OrchestratorService:
                 },
             )
             return self._package(package_id)
+
+    def derive_submission_evidence(self, actor: ActorIdentity, work_package_id: int, head_commit: str) -> SubmissionEvidence:
+        """Derive submission evidence for a work package while authorizing assigned worker or controller."""
+        pkg = self._package(work_package_id)
+        task = self._task(int(pkg["task_id"]))
+        proj_id = int(task["project_id"])
+
+        if actor.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+            if (
+                pkg.get("claimed_by_agent") != actor.name
+                and pkg.get("assigned_junior_agent") != actor.name
+                and pkg.get("assigned_pro_agent") != actor.name
+            ):
+                raise OrchestratorError(f"Worker {actor.name} is not authorized for package {work_package_id}")
+        elif actor.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+            if not self._is_authorized_for_project(actor, proj_id, task_id=task["id"]):
+                raise OrchestratorError(f"Actor {actor.name!r} is not authorized for task {task['id']}")
+
+        proj = self._project(proj_id)
+        return RepositoryBoundary(Path(proj["repo_path"])).derive_submission(pkg["base_commit"], head_commit)
 
     def submit_package(
         self,
@@ -3862,11 +3900,12 @@ class OrchestratorService:
                     (target_type = 'task' AND target_id = ?)
                     OR (target_type = 'work_package' AND target_id IN (SELECT id FROM work_packages WHERE task_id = ?))
                     OR (target_type = 'submission' AND target_id IN (SELECT id FROM submissions WHERE work_package_id IN (SELECT id FROM work_packages WHERE task_id = ?)))
-                    OR (target_type = 'review' AND target_id IN (SELECT id FROM reviews WHERE (target_type = 'task' AND target_id = ?) OR target_id IN (SELECT id FROM work_packages WHERE task_id = ?)))
+                    OR (target_type = 'review' AND target_id IN (SELECT id FROM reviews WHERE (target_type = 'task' AND target_id = ?) OR (target_type = 'work_package' AND target_id IN (SELECT id FROM work_packages WHERE task_id = ?))))
                     OR (target_type = 'mimo_session' AND target_id IN (SELECT id FROM mimo_sessions WHERE task_id = ?))
                     OR (target_type = 'role_delegation' AND target_id IN (SELECT id FROM role_delegations WHERE task_id = ?))
+                    OR (target_type = 'test_run' AND target_id IN (SELECT id FROM test_runs WHERE task_id = ?))
                     ORDER BY id""",
-                (tid, tid, tid, tid, tid, tid, tid),
+                (tid, tid, tid, tid, tid, tid, tid, tid),
             )
         return [{**dict(row), "payload": _loads(str(row["payload_json"]))} for row in rows]
 
@@ -3892,8 +3931,9 @@ class OrchestratorService:
                     OR (target_type = 'mimo_session' AND target_id IN (SELECT id FROM mimo_sessions WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)))
                     OR (target_type = 'grace_artifact' AND target_id IN (SELECT id FROM grace_artifacts WHERE project_id = ?))
                     OR (target_type = 'role_delegation' AND target_id IN (SELECT id FROM role_delegations WHERE project_id = ?))
+                    OR (target_type = 'test_run' AND target_id IN (SELECT id FROM test_runs WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)))
                     ORDER BY id DESC LIMIT 10""",
-                (pid, pid, pid, pid, pid, pid, pid, pid, pid, pid),
+                (pid, pid, pid, pid, pid, pid, pid, pid, pid, pid, pid),
             )
         else:
             projects_rows = self.store.fetchall("SELECT * FROM projects ORDER BY id")
@@ -4087,11 +4127,12 @@ class OrchestratorService:
                      (target_type = 'task' AND target_id = ?)
                      OR (target_type = 'work_package' AND target_id IN (SELECT id FROM work_packages WHERE task_id = ?))
                      OR (target_type = 'submission' AND target_id IN (SELECT id FROM submissions WHERE work_package_id IN (SELECT id FROM work_packages WHERE task_id = ?)))
-                     OR (target_type = 'review' AND target_id IN (SELECT id FROM reviews WHERE (target_type = 'task' AND target_id = ?) OR target_id IN (SELECT id FROM work_packages WHERE task_id = ?)))
+                     OR (target_type = 'review' AND target_id IN (SELECT id FROM reviews WHERE (target_type = 'task' AND target_id = ?) OR (target_type = 'work_package' AND target_id IN (SELECT id FROM work_packages WHERE task_id = ?))))
                      OR (target_type = 'mimo_session' AND target_id IN (SELECT id FROM mimo_sessions WHERE task_id = ?))
                      OR (target_type = 'role_delegation' AND target_id IN (SELECT id FROM role_delegations WHERE task_id = ?))
+                     OR (target_type = 'test_run' AND target_id IN (SELECT id FROM test_runs WHERE task_id = ?))
                    ) ORDER BY id ASC LIMIT ?""",
-                (after_audit_id, tid, tid, tid, tid, tid, tid, tid, clamped_limit + 1),
+                (after_audit_id, tid, tid, tid, tid, tid, tid, tid, tid, clamped_limit + 1),
             )
 
         has_more = len(rows) > clamped_limit

@@ -28,6 +28,8 @@ def create_test_project_and_task(service: OrchestratorService, codex_actor: Acto
         main_branch="main",
         allowed_test_commands={"fast": ["pytest"]},
     )
+    service.register_agent(codex_actor, proj["id"], "glm", OrchestratorRole.GLM, [OrchestratorRole.GLM])
+    service.register_agent(codex_actor, proj["id"], "glm-1", OrchestratorRole.GLM, [OrchestratorRole.GLM])
     task = service.create_codex_task(
         codex_actor,
         proj["id"],

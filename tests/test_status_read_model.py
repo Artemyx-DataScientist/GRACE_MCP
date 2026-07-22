@@ -33,6 +33,13 @@ def test_status_snapshot_with_data(tmp_path):
         main_branch="main",
         allowed_test_commands={"fast": ["pytest"]},
     )
+    service.register_agent(
+        codex_actor,
+        proj["id"],
+        name="glm-1",
+        primary_role=OrchestratorRole.GLM,
+        capabilities=[OrchestratorRole.GLM],
+    )
 
     task = service.create_codex_task(
         codex_actor,

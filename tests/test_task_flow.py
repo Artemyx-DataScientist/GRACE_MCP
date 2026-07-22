@@ -566,6 +566,7 @@ def test_controller_owned_task_completion_can_reach_final_review_without_package
     codex = _actor("codex", OrchestratorRole.CODEX)
     glm = _actor("glm-5.2", OrchestratorRole.GLM)
     project = service.init_project(codex, "demo", tmp_path, tmp_path / "grace", "main", {})
+    service.register_agent(codex, project["id"], glm.name, OrchestratorRole.GLM, [OrchestratorRole.GLM])
     task = service.create_codex_task(
         codex,
         project["id"],
@@ -629,6 +630,7 @@ def test_controller_owned_task_completion_cannot_bypass_existing_package(tmp_pat
     codex = _actor("codex", OrchestratorRole.CODEX)
     glm = _actor("glm", OrchestratorRole.GLM)
     project = service.init_project(codex, "demo", tmp_path, tmp_path / "grace", "main", {"unit": ["python", "-m", "pytest"]})
+    service.register_agent(codex, project["id"], glm.name, OrchestratorRole.GLM, [OrchestratorRole.GLM])
     service.register_agent(codex, project["id"], "junior", OrchestratorRole.WORKER_JUNIOR, [OrchestratorRole.WORKER_JUNIOR], mimo_model="xiaomi/mimo-v2.5")
     service.register_agent(codex, project["id"], "pro", OrchestratorRole.WORKER_PRO, [OrchestratorRole.WORKER_PRO], mimo_model="xiaomi/mimo-v2.5-pro")
     task = service.create_codex_task(codex, project["id"], "t", "o", "i", [], [], [], ["src/**"], [])

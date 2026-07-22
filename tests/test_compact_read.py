@@ -39,6 +39,7 @@ def test_get_task_and_package_summaries(tmp_path):
     repo_dir.mkdir(parents=True, exist_ok=True)
 
     proj = service.init_project(codex, "summary-proj", repo_dir, repo_dir, "main", {"fast": ["pytest"]})
+    service.register_agent(codex, proj["id"], glm.name, OrchestratorRole.GLM, [OrchestratorRole.GLM])
     task = service.create_codex_task(
         codex, proj["id"], "Summary Task", "obj", "intent", [], [], ["criteria"], ["src/**"], []
     )
@@ -73,6 +74,7 @@ def test_paginated_handoff_and_audit_log(tmp_path):
     repo_dir.mkdir(parents=True, exist_ok=True)
 
     proj = service.init_project(codex, "page-proj", repo_dir, repo_dir, "main", {"fast": ["pytest"]})
+    service.register_agent(codex, proj["id"], glm.name, OrchestratorRole.GLM, [OrchestratorRole.GLM])
     task = service.create_codex_task(
         codex, proj["id"], "Page Task", "obj", "intent", [], [], ["criteria"], ["src/**"], []
     )

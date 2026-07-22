@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any
 
@@ -15,7 +16,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp.exceptions import ToolError
 
-from conftest import packet_kwargs
+from conftest import packet_kwargs, worker_report
 from grace_orchestrator.models import ActorIdentity, OrchestratorRole
 from grace_orchestrator.server import create_server
 from grace_orchestrator.service import OrchestratorService
@@ -95,6 +96,7 @@ def _create_package(
     objective: str = "implement the bounded change",
     junior: ActorIdentity | None = None,
     allowed_files: list[str] | None = None,
+    base_commit: str = "a" * 40,
     assign: bool = True,
 ) -> dict[str, Any]:
     worker = junior or case["junior"]
@@ -107,7 +109,7 @@ def _create_package(
         ["tests/protected/**"],
         worker.name,
         case["pro"].name,
-        "a" * 40,
+        base_commit,
         **packet_kwargs(),
     )
     if assign:
@@ -162,6 +164,18 @@ def _call_tool(server: Any, name: str, arguments: dict[str, Any]) -> dict[str, A
     structured = result[1]
     assert isinstance(structured, dict)
     return structured
+
+
+def _git(root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return result.stdout.strip()
 
 
 def test_gui_neutral_inbox_state_is_shared_between_server_instances(tmp_path: Path) -> None:
@@ -338,6 +352,69 @@ def test_codex_inbox_does_not_offer_undelegated_glm_action(tmp_path: Path) -> No
     assert "task.plan" not in actions
 
 
+def test_unregistered_glm_cannot_mutate_foreign_project_over_public_mcp(tmp_path: Path) -> None:
+    case = _base_case(tmp_path)
+    fresh = case["service"].create_codex_task(
+        case["codex"],
+        case["project"]["id"],
+        "Foreign mutation target",
+        "must remain controlled by project membership",
+        "actor-bound mutation authorization",
+        [],
+        [],
+        [],
+        ["src/**"],
+        ["tests/**"],
+    )
+    outsider = _actor("glm-unregistered", OrchestratorRole.GLM)
+    server = create_server(outsider, tmp_path)
+
+    with pytest.raises(ToolError):
+        asyncio.run(server.call_tool("task.plan", {"task_id": fresh["id"]}))
+
+    assert case["service"].get_task(fresh["id"])["status"] == "CODEX_TASK_CREATED"
+
+
+def test_worker_can_submit_claimed_package_over_public_mcp(tmp_path: Path) -> None:
+    case = _base_case(tmp_path)
+    _git(case["repo"], "init")
+    _git(case["repo"], "config", "user.email", "orchestrator@example.invalid")
+    _git(case["repo"], "config", "user.name", "Orchestrator Test")
+    source = case["repo"] / "src" / "contract" / "change.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("value = 1\n", encoding="utf-8")
+    _git(case["repo"], "add", ".")
+    _git(case["repo"], "commit", "-m", "base")
+    base_commit = _git(case["repo"], "rev-parse", "HEAD")
+    package = _create_package(case, base_commit=base_commit)
+    case["service"].claim_work_package(case["junior"], package["id"])
+
+    source.write_text("value = 2\n", encoding="utf-8")
+    _git(case["repo"], "add", ".")
+    _git(case["repo"], "commit", "-m", "worker change")
+    head_commit = _git(case["repo"], "rev-parse", "HEAD")
+    server = create_server(case["junior"], tmp_path)
+
+    submission = _call_tool(
+        server,
+        "submission.create",
+        {
+            "work_package_id": package["id"],
+            "summary": "bounded implementation",
+            "head_commit": head_commit,
+            "tests_run": [{"command_key": "unit", "exit_code": 0}],
+            "risk_notes": "none",
+            "worker_report": worker_report(
+                task_id=case["task"]["id"],
+                package_id=package["id"],
+                files_changed=["src/contract/change.py"],
+            ),
+        },
+    )
+
+    assert submission["submitted_by_agent"] == case["junior"].name
+
+
 @pytest.fixture
 def populated_project_case(tmp_path: Path) -> dict[str, Any]:
     case = _base_case(tmp_path)
@@ -490,6 +567,106 @@ def test_project_snapshot_never_contains_foreign_project_audit_events(tmp_path: 
         event["target_type"] == "task" and event["target_id"] == foreign_task["id"]
         for event in snapshot["recent_audit_events"]
     )
+
+
+def test_task_audit_includes_registered_test_run_evidence(tmp_path: Path) -> None:
+    case = _base_case(tmp_path)
+    package = _create_package(case)
+    result = case["service"].run_allowed_test(
+        case["junior"],
+        case["project"]["id"],
+        case["task"]["id"],
+        package["id"],
+        "unit",
+    )
+    test_run = case["service"].store.fetchone(
+        "SELECT id FROM test_runs WHERE stdout_path = ?",
+        (str(result.stdout_path),),
+    )
+    assert test_run is not None
+
+    audits = case["service"].list_audit(case["glm"], task_id=case["task"]["id"])
+
+    assert any(
+        event["target_type"] == "test_run"
+        and event["event_type"] == "repo.test_run_recorded"
+        and event["target_id"] == int(test_run["id"])
+        for event in audits
+    )
+
+
+def test_project_snapshot_includes_registered_test_run_evidence(tmp_path: Path) -> None:
+    case = _base_case(tmp_path)
+    package = _create_package(case)
+    case["service"].run_allowed_test(
+        case["junior"],
+        case["project"]["id"],
+        case["task"]["id"],
+        package["id"],
+        "unit",
+    )
+
+    snapshot = case["service"].get_orchestrator_status_snapshot(case["glm"], case["project"]["id"])
+
+    assert any(
+        event["target_type"] == "test_run" and event["event_type"] == "repo.test_run_recorded"
+        for event in snapshot["recent_audit_events"]
+    )
+
+
+def test_task_audit_review_filter_is_target_type_safe(tmp_path: Path) -> None:
+    case = _base_case(tmp_path)
+    foreign_task = case["service"].create_codex_task(
+        case["codex"],
+        case["project"]["id"],
+        "Foreign reviewed task",
+        "must not enter the first task audit",
+        "target-type-safe audit filtering",
+        [],
+        [],
+        [],
+        ["src/**"],
+        ["tests/**"],
+    )
+    case["service"].plan_task(case["glm"], foreign_task["id"])
+    case["service"].register_verification_plan(case["glm"], foreign_task["id"], "deterministic", ["unit"])
+    case["service"].create_work_package(
+        case["glm"],
+        foreign_task["id"],
+        "ID alignment package",
+        "reserve the first package id",
+        ["src/foreign/**"],
+        ["tests/protected/**"],
+        case["junior"].name,
+        case["pro"].name,
+        "a" * 40,
+        **packet_kwargs(),
+    )
+    own_package = _create_package(case, allowed_files=["src/own/**"], assign=False)
+    assert own_package["id"] == foreign_task["id"]
+
+    with case["service"].store.transaction() as conn:
+        review_cursor = conn.execute(
+            """INSERT INTO reviews (
+                 target_type, target_id, reviewer_role, reviewer_agent, effective_role,
+                 decision, findings_json, required_fixes_json, created_at
+               ) VALUES ('task', ?, 'glm', ?, 'glm', 'blocked', '[]', '[]', ?)""",
+            (foreign_task["id"], case["glm"].name, "2026-07-22T00:00:00+00:00"),
+        )
+        foreign_review_id = int(review_cursor.lastrowid or 0)
+        case["service"]._audit(
+            conn,
+            case["glm"],
+            OrchestratorRole.GLM,
+            "review.foreign_test_event",
+            "review",
+            foreign_review_id,
+            {"task_id": foreign_task["id"]},
+        )
+
+    audits = case["service"].list_audit(case["glm"], task_id=case["task"]["id"])
+
+    assert not any(event["event_type"] == "review.foreign_test_event" for event in audits)
 
 
 def test_worker_task_summary_ignores_inaccessible_sibling_sessions(tmp_path: Path) -> None:

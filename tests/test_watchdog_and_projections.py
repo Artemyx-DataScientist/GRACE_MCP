@@ -90,6 +90,13 @@ def test_circuit_breaker_triggers_human_intervention(tmp_path):
     service.register_agent(
         codex_actor,
         proj["id"],
+        name="glm-1",
+        primary_role=OrchestratorRole.GLM,
+        capabilities=[OrchestratorRole.GLM],
+    )
+    service.register_agent(
+        codex_actor,
+        proj["id"],
         name="junior-1",
         primary_role=OrchestratorRole.WORKER_JUNIOR,
         capabilities=[OrchestratorRole.WORKER_JUNIOR],

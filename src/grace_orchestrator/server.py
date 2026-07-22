@@ -651,10 +651,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
         risk_notes: str,
         worker_report: dict[str, Any],
     ) -> dict[str, Any]:
-        package = service.get_work_package(actor, work_package_id)
-        task = service.get_task(actor, package["task_id"])
-        project = service.get_project(actor, task["project_id"])
-        evidence = RepositoryBoundary(Path(project["repo_path"])).derive_submission(package["base_commit"], head_commit)
+        evidence = service.derive_submission_evidence(actor, work_package_id, head_commit)
         return _plain(service.submit_package(actor, work_package_id, summary, evidence, tests_run, risk_notes, worker_report))
 
     @tool_decorator("submission.controller_repair", description="Store an audited Codex controller repair submission for a rejected package when Pro repair is unavailable.")
@@ -666,10 +663,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
         risk_notes: str,
         controller_report: dict[str, Any],
     ) -> dict[str, Any]:
-        package = service.get_work_package(actor, work_package_id)
-        task = service.get_task(actor, package["task_id"])
-        project = service.get_project(actor, task["project_id"])
-        evidence = RepositoryBoundary(Path(project["repo_path"])).derive_submission(package["base_commit"], head_commit)
+        evidence = service.derive_submission_evidence(actor, work_package_id, head_commit)
         return _plain(
             service.submit_controller_repair(
                 actor,
@@ -692,8 +686,8 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
         risk_notes: str,
         controller_report: dict[str, Any],
     ) -> dict[str, Any]:
-        task = service.get_task(task_id)
-        project = service.get_project(task["project_id"])
+        task = service.get_task(actor, task_id)
+        project = service.get_project(actor, task["project_id"])
         evidence = RepositoryBoundary(Path(project["repo_path"])).derive_submission(base_commit, head_commit)
         return _plain(
             service.submit_controller_task_completion(

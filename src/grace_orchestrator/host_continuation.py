@@ -39,7 +39,8 @@ import uuid
 
 from .models import stable_hash
 from .db import OrchestratorStore
-from .process_identity import ProcessIdentity, ProcessMatchState, verify_process_liveness
+from .process_identity import ProcessIdentity, ProcessMatchState, capture_process_identity, verify_process_liveness
+
 
 TRIGGER_EVENT_TYPES = frozenset(
     {
@@ -197,6 +198,8 @@ class HostContinuationSupervisor:
         self.lock_root = self.state_dir / "locks"
         self.prompt_root = self.state_dir / "prompts"
         self._last_spawned_pid: int | None = None
+        self._last_spawned_argv: list[str] | None = None
+        self._last_spawned_nonce: str | None = None
 
     def run_forever(self) -> None:
         """Poll durable run events until the host process is stopped."""
@@ -482,11 +485,20 @@ class HostContinuationSupervisor:
 
                 # Tri-state process liveness check
                 is_alive = False
+                is_uncertain = False
                 if pid:
-                    ident = ProcessIdentity(pid=int(pid), process_started_at_os="UNKNOWN", executable_path="", argv_hash="", launch_nonce="")
+                    ident = ProcessIdentity(
+                        pid=int(pid),
+                        process_started_at_os=str(deliv.get("controller_process_started_at_os") or "UNKNOWN"),
+                        executable_path=str(deliv.get("controller_executable_path") or ""),
+                        argv_hash=str(deliv.get("controller_argv_hash") or ""),
+                        launch_nonce=str(deliv.get("controller_launch_nonce") or ""),
+                    )
                     match_state = verify_process_liveness(ident)
                     if match_state == ProcessMatchState.MATCH:
                         is_alive = True
+                    elif match_state == ProcessMatchState.UNKNOWN:
+                        is_uncertain = True
 
                 if is_alive:
                     new_lease = datetime.fromtimestamp(now_dt.timestamp() + 300, UTC).isoformat()
@@ -495,6 +507,14 @@ class HostContinuationSupervisor:
                         (new_lease, deliv["continuation_id"]),
                     )
                     recovered.append({"continuation_id": deliv["continuation_id"], "status": "lease_extended"})
+                elif is_uncertain:
+                    # UNKNOWN status: do NOT spawn duplicate controller. Extend bounded uncertainty lease (60s).
+                    new_lease = datetime.fromtimestamp(now_dt.timestamp() + 60, UTC).isoformat()
+                    conn.execute(
+                        "UPDATE continuation_deliveries SET lease_expires_at = ?, last_error = ? WHERE continuation_id = ?",
+                        (new_lease, "Controller process liveness status UNKNOWN; uncertainty lease extended", deliv["continuation_id"]),
+                    )
+                    recovered.append({"continuation_id": deliv["continuation_id"], "status": "uncertainty_extended"})
                 else:
                     if attempts >= 3:
                         conn.execute(
@@ -509,9 +529,10 @@ class HostContinuationSupervisor:
                             """UPDATE continuation_deliveries 
                                SET state = 'RETRY_WAIT', next_attempt_at = ?, last_error = ? 
                                WHERE continuation_id = ?""",
-                            (next_retry, "Controller exited or unacknowledged lease expired", deliv["continuation_id"]),
+                            (next_retry, "Controller process confirmed dead (NOT_FOUND_OR_REUSED)", deliv["continuation_id"]),
                         )
                         recovered.append({"continuation_id": deliv["continuation_id"], "status": "retry_unacked"})
+
 
         return recovered
 
@@ -572,19 +593,31 @@ class HostContinuationSupervisor:
         if not events_path.is_file():
             events_path = self.data_dir / run_id / "events.ndjson"
         if not events_path.is_file():
+            backoff_sec = 5 if attempts <= 1 else (30 if attempts == 2 else 120)
+            next_retry = datetime.fromtimestamp(datetime.now(UTC).timestamp() + backoff_sec, UTC).isoformat()
             with store.transaction() as conn:
                 conn.execute(
-                    "UPDATE continuation_deliveries SET state = 'RETRY_WAIT', last_error = ? WHERE continuation_id = ?",
-                    ("Events log file missing", continuation_id),
+                    """UPDATE continuation_deliveries 
+                       SET state = 'RETRY_WAIT', next_attempt_at = ?, last_error = ? 
+                       WHERE continuation_id = ? AND attempt_id = ? AND state = 'CLAIMED'""",
+                    (next_retry, "Events log file missing", continuation_id, attempt_id),
                 )
             return {"continuation_id": continuation_id, "status": "events_path_missing"}
 
-        all_events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        all_events: list[tuple[int, dict[str, Any]]] = []
+        for line_idx, line in enumerate(events_path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                evt = json.loads(line)
+                if isinstance(evt, dict):
+                    all_events.append((line_idx, evt))
+            except json.JSONDecodeError:
+                logger.warning("Corrupt JSON line %d in %s", line_idx, events_path)
+
         trigger_event = None
         event_idx = 0
-        for idx, evt in enumerate(all_events, start=1):
-            if not isinstance(evt, dict):
-                continue
+        for idx, evt in all_events:
             evt_id = _event_identity(run_id, idx, evt)
             if evt_id == delivery["source_event_id"]:
                 trigger_event = evt
@@ -592,10 +625,14 @@ class HostContinuationSupervisor:
                 break
 
         if trigger_event is None:
+            backoff_sec = 5 if attempts <= 1 else (30 if attempts == 2 else 120)
+            next_retry = datetime.fromtimestamp(datetime.now(UTC).timestamp() + backoff_sec, UTC).isoformat()
             with store.transaction() as conn:
                 conn.execute(
-                    "UPDATE continuation_deliveries SET state = 'RETRY_WAIT', last_error = ? WHERE continuation_id = ?",
-                    (f"Source event {delivery['source_event_id']} not found in events log", continuation_id),
+                    """UPDATE continuation_deliveries 
+                       SET state = 'RETRY_WAIT', next_attempt_at = ?, last_error = ? 
+                       WHERE continuation_id = ? AND attempt_id = ? AND state = 'CLAIMED'""",
+                    (next_retry, f"Source event {delivery['source_event_id']} not found in events log", continuation_id, attempt_id),
                 )
             return {"continuation_id": continuation_id, "status": "no_trigger_event"}
 
@@ -629,17 +666,49 @@ class HostContinuationSupervisor:
             resumed = self._attempt_resume(context, prompt_path)
             logical = False if resumed else self._attempt_logical_start(context, prompt_path)
             spawn_pid = self._last_spawned_pid
+            spawn_argv = self._last_spawned_argv or []
+            spawn_nonce = self._last_spawned_nonce or ""
 
-            # STEP 3: Short update transaction after Popen
+            # STEP 3: Short update transaction after Popen with Process Identity capture
             with store.transaction() as conn:
-                if resumed or logical:
-                    ack_lease = datetime.fromtimestamp(datetime.now(UTC).timestamp() + 300, UTC).isoformat()
-                    conn.execute(
-                        """UPDATE continuation_deliveries 
-                           SET state = 'CONTROLLER_STARTED', lease_expires_at = ?, controller_pid = ? 
-                           WHERE continuation_id = ? AND attempt_id = ?""",
-                        (ack_lease, spawn_pid, continuation_id, attempt_id),
+                if (resumed or logical) and spawn_pid:
+                    ident = capture_process_identity(
+                        spawn_pid,
+                        spawn_argv[0] if spawn_argv else "",
+                        spawn_argv,
+                        launch_nonce=spawn_nonce,
                     )
+                    ack_lease = datetime.fromtimestamp(datetime.now(UTC).timestamp() + 300, UTC).isoformat()
+                    cursor = conn.execute(
+                        """UPDATE continuation_deliveries 
+                           SET state = 'CONTROLLER_STARTED', lease_expires_at = ?, controller_pid = ?,
+                               controller_process_started_at_os = ?, controller_executable_path = ?,
+                               controller_argv_hash = ?, controller_launch_nonce = ? 
+                           WHERE continuation_id = ? AND attempt_id = ? AND state = 'CLAIMED'""",
+                        (
+                            ack_lease,
+                            spawn_pid,
+                            str(ident.process_started_at_os),
+                            str(ident.executable_path),
+                            ident.argv_hash,
+                            ident.launch_nonce,
+                            continuation_id,
+                            attempt_id,
+                        ),
+                    )
+                    if cursor.rowcount == 0:
+                        rec = conn.execute(
+                            "SELECT state FROM continuation_deliveries WHERE continuation_id = ?",
+                            (continuation_id,),
+                        ).fetchone()
+                        if rec and rec["state"] in ("ACKNOWLEDGED", "RESOLVED"):
+                            return {
+                                "continuation_id": continuation_id,
+                                "attempt_id": attempt_id,
+                                "status": "already_acknowledged",
+                                "attempts": attempts,
+                                "pid": spawn_pid,
+                            }
                     return {"continuation_id": continuation_id, "attempt_id": attempt_id, "status": "started", "attempts": attempts, "pid": spawn_pid}
                 else:
                     backoff_sec = 5 if attempts == 1 else (30 if attempts == 2 else 120)
@@ -647,10 +716,11 @@ class HostContinuationSupervisor:
                     conn.execute(
                         """UPDATE continuation_deliveries 
                            SET state = 'RETRY_WAIT', next_attempt_at = ?, last_error = ? 
-                           WHERE continuation_id = ? AND attempt_id = ?""",
+                           WHERE continuation_id = ? AND attempt_id = ? AND state = 'CLAIMED'""",
                         (next_retry, "Controller command failed to start", continuation_id, attempt_id),
                     )
                     return {"continuation_id": continuation_id, "attempt_id": attempt_id, "status": "retry_scheduled", "attempts": attempts}
+
         finally:
             self._release_lock(lock_path)
 
@@ -734,6 +804,7 @@ class HostContinuationSupervisor:
             return {"ok": False, "attempted_mode": mode, "reason": "Configured command is empty"}
         if "{prompt_file}" not in command_template and "{prompt}" not in command_template:
             argv.append(str(prompt_path))
+        launch_nonce = uuid.uuid4().hex[:16]
         env = os.environ.copy()
         env.update(
             {
@@ -743,6 +814,7 @@ class HostContinuationSupervisor:
                 "GRACE_CONTINUATION_ID": str(context.get("continuation_id") or ""),
                 "GRACE_CONTINUATION_SOURCE_EVENT_ID": str(context.get("source_event_id") or ""),
                 "GRACE_CONTINUATION_ATTEMPT_ID": str(context.get("attempt_id") or ""),
+                "GRACE_CONTINUATION_LAUNCH_NONCE": launch_nonce,
                 "GRACE_CONTINUATION_RUN_ID": str(context.get("run_id") or ""),
                 "GRACE_CONTINUATION_ATTEMPT": str(context.get("attempt_count") or "1"),
                 "GRACE_CONTROLLER_CONTINUATION_TASK_ID": str(context.get("task_id") or ""),
@@ -756,7 +828,11 @@ class HostContinuationSupervisor:
             process = subprocess.Popen(argv, cwd=cwd, env=env)
         except OSError as error:
             return {"ok": False, "attempted_mode": mode, "argv": argv, "cwd": str(cwd), "reason": str(error)}
-        result: dict[str, Any] = {"ok": True, "attempted_mode": mode, "pid": process.pid, "argv": argv, "cwd": str(cwd)}
+        self._last_spawned_pid = process.pid
+        self._last_spawned_argv = argv
+        self._last_spawned_nonce = launch_nonce
+        result: dict[str, Any] = {"ok": True, "attempted_mode": mode, "pid": process.pid, "argv": argv, "cwd": str(cwd), "launch_nonce": launch_nonce}
+
         if self.config.command_wait_seconds > 0:
             try:
                 exit_code = process.wait(timeout=self.config.command_wait_seconds)

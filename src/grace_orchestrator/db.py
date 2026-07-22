@@ -199,7 +199,7 @@ CREATE TABLE IF NOT EXISTS mimo_sessions (
   mimo_model TEXT NOT NULL,
   mimo_agent TEXT,
   mode TEXT NOT NULL CHECK(mode IN ('headless', 'tui')),
-  lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('PREPARED', 'RUNNING', 'TUI_DETACHED', 'EXITED', 'FAILED', 'CANCELLED', 'ABANDONED', 'WATCHDOG_UNCERTAIN')),
+  lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('PREPARED', 'RUNNING', 'TUI_DETACHED', 'EXITED', 'WORKER_CRASHED', 'WORKER_EXITED_WITHOUT_HANDOFF', 'WORKER_UNRESPONSIVE', 'WATCHDOG_UNCERTAIN', 'FAILED', 'CANCELLED', 'ABANDONED')),
   workspace_path TEXT,
   briefing_path TEXT,
   command_json TEXT,
@@ -263,6 +263,10 @@ CREATE TABLE IF NOT EXISTS continuation_deliveries (
   next_attempt_at TEXT NOT NULL,
   lease_expires_at TEXT,
   controller_pid INTEGER,
+  controller_process_started_at_os TEXT,
+  controller_executable_path TEXT,
+  controller_argv_hash TEXT,
+  controller_launch_nonce TEXT,
   controller_session_id TEXT,
   acknowledged_at TEXT,
   resolved_at TEXT,
@@ -329,18 +333,23 @@ class OrchestratorStore:
             self._ensure_column("continuation_deliveries", "claimed_by", "TEXT")
             self._ensure_column("continuation_deliveries", "attempt_id", "TEXT")
             self._ensure_column("continuation_deliveries", "resolution_json", "TEXT")
+            self._ensure_column("continuation_deliveries", "controller_process_started_at_os", "TEXT")
+            self._ensure_column("continuation_deliveries", "controller_executable_path", "TEXT")
+            self._ensure_column("continuation_deliveries", "controller_argv_hash", "TEXT")
+            self._ensure_column("continuation_deliveries", "controller_launch_nonce", "TEXT")
             self.connection.execute(
                 "UPDATE work_packages SET worker_pro_available = 1 WHERE status = 'REPAIR_REQUIRED'"
             )
             
             user_ver = self.connection.execute("PRAGMA user_version").fetchone()[0]
-            if user_ver < 2:
+            if user_ver < 3:
                 self.connection.execute("PRAGMA foreign_keys = OFF")
                 mimo_cols = [row["name"] for row in self.connection.execute("PRAGMA table_info(mimo_sessions)").fetchall()]
                 if mimo_cols:
                     col_str = ", ".join(mimo_cols)
+                    old_count = self.connection.execute("SELECT COUNT(*) FROM mimo_sessions").fetchone()[0]
                     self.connection.execute("""
-                        CREATE TABLE IF NOT EXISTS mimo_sessions_new (
+                        CREATE TABLE IF NOT EXISTS mimo_sessions_v3 (
                           id INTEGER PRIMARY KEY,
                           project_id INTEGER NOT NULL REFERENCES projects(id),
                           task_id INTEGER NOT NULL REFERENCES tasks(id),
@@ -351,7 +360,7 @@ class OrchestratorStore:
                           mimo_model TEXT NOT NULL,
                           mimo_agent TEXT,
                           mode TEXT NOT NULL CHECK(mode IN ('headless', 'tui')),
-                          lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('PREPARED', 'RUNNING', 'TUI_DETACHED', 'EXITED', 'FAILED', 'CANCELLED', 'ABANDONED', 'WATCHDOG_UNCERTAIN')),
+                          lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('PREPARED', 'RUNNING', 'TUI_DETACHED', 'EXITED', 'WORKER_CRASHED', 'WORKER_EXITED_WITHOUT_HANDOFF', 'WORKER_UNRESPONSIVE', 'WATCHDOG_UNCERTAIN', 'FAILED', 'CANCELLED', 'ABANDONED')),
                           workspace_path TEXT,
                           briefing_path TEXT,
                           command_json TEXT,
@@ -369,11 +378,15 @@ class OrchestratorStore:
                           ended_at TEXT
                         );
                     """)
-                    self.connection.execute(f"INSERT INTO mimo_sessions_new ({col_str}) SELECT {col_str} FROM mimo_sessions;")
+                    self.connection.execute(f"INSERT INTO mimo_sessions_v3 ({col_str}) SELECT {col_str} FROM mimo_sessions;")
+                    new_count = self.connection.execute("SELECT COUNT(*) FROM mimo_sessions_v3").fetchone()[0]
+                    if old_count != new_count:
+                        raise RuntimeError(f"Migration v3 failed: expected {old_count} rows, copied {new_count}")
                     self.connection.execute("DROP TABLE mimo_sessions;")
-                    self.connection.execute("ALTER TABLE mimo_sessions_new RENAME TO mimo_sessions;")
-                self.connection.execute("PRAGMA user_version = 2;")
+                    self.connection.execute("ALTER TABLE mimo_sessions_v3 RENAME TO mimo_sessions;")
+                self.connection.execute("PRAGMA user_version = 3;")
                 self.connection.execute("PRAGMA foreign_keys = ON;")
+
             self.connection.execute("PRAGMA journal_mode = WAL")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:

@@ -119,5 +119,15 @@ def test_worker_scoped_surface_isolation(tmp_path) -> None:
     assert "task.create_codex_task" not in worker_tools
     assert "workpackage.create" not in worker_tools
     assert "task.force_transition" not in worker_tools
+    assert "submission.controller_repair" not in worker_tools
+    assert "grace.upsert_artifact" not in worker_tools
+    assert "gate.contract_discovery" not in worker_tools
+    assert "gate.validate_execution_packet" not in worker_tools
+    assert "handoff.list_events" not in worker_tools
     assert "workpackage.claim" in worker_tools
     assert "submission.create" in worker_tools
+
+    # Test actual callability of registered worker tools
+    res = asyncio.run(worker_server.call_tool("orchestrator.whoami", {}))
+    assert res is not None
+

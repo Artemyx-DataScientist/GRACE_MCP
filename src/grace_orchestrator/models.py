@@ -108,6 +108,8 @@ class MimoSessionStatus(StrEnum):
     WATCHDOG_UNCERTAIN = "WATCHDOG_UNCERTAIN"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    ABANDONED = "ABANDONED"
+
 
 
 class HostContinuationEventType(StrEnum):

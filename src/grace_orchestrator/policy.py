@@ -729,16 +729,15 @@ def project_next_action(
         return {"role": "glm", "action": "verification.register_plan or submission.controller_task_completion"}
     if task_status == "GLM_TESTS_PREPARED":
         return {"role": "glm", "action": "workpackage.create or submission.controller_task_completion"}
+    if task_status == "GLM_REJECTED_REPAIR_REQUIRED":
+        return {"role": "glm", "action": "mimo.launch_package or submission.controller_repair"}
 
     pkgs = list(packages or [])
-
-    # Check for blocked packages
     for pkg in pkgs:
         st = str(pkg.get("status", ""))
         if st in BLOCKED_WORK_PACKAGE_STATUSES:
             return {"role": "user_or_codex", "action": f"workpackage.force_reset or task.force_transition for package #{pkg.get('id')}"}
 
-    # Check active package states
     for pkg in pkgs:
         st = str(pkg.get("status", ""))
         if st == "CREATED":
@@ -759,7 +758,8 @@ def project_next_action(
         return {"role": "codex", "action": "review.codex_submit"}
     if task_status == "CODEX_ACCEPTED":
         return {"role": "codex", "action": "task.close"}
-    if task_status == "CLOSED":
+    if task_status in {"CLOSED", "TASK_CLOSED"}:
         return {"role": "none", "action": "none"}
 
     return {"role": "codex", "action": "task.get"}
+

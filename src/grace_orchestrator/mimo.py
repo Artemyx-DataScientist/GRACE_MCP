@@ -55,6 +55,9 @@ def is_external_antigravity_runtime(runtime: str | None | ExecutionRuntime) -> b
     return canonical_runtime(runtime) == ExecutionRuntime.ANTIGRAVITY
 
 
+from .process_identity import capture_process_identity
+
+
 @dataclass(frozen=True, slots=True)
 class MimoLaunchResult:
     """Process evidence returned after a fixed-argv Mimo launch."""
@@ -64,6 +67,11 @@ class MimoLaunchResult:
     stdout_path: Path | None
     stderr_path: Path | None
     detached_tui: bool
+    process_started_at_os: str = "UNKNOWN"
+    executable_path: str = ""
+    argv_hash: str = ""
+    launch_nonce: str = ""
+
 
 
 class MimoRunner:
@@ -191,11 +199,18 @@ class MimoRunner:
                 process = subprocess.Popen(argv, cwd=workspace_path, shell=False, creationflags=creationflags)
             except OSError as error:
                 raise OrchestratorError(f"Mimo TUI launch failed: {error}") from error
+            ident = capture_process_identity(process.pid, argv[0] if argv else "", argv)
             logger.info(
                 "[GraceOrchestrator][mimo][TUI_SESSION_LAUNCH] started detached Mimo TUI",
                 extra={"session_id": session_id, "pid": process.pid, "model": model},
             )
-            return MimoLaunchResult(argv, process.pid, None, None, detached_tui=True)
+            return MimoLaunchResult(
+                argv, process.pid, None, None, detached_tui=True,
+                process_started_at_os=str(ident.process_started_at_os),
+                executable_path=str(ident.executable_path),
+                argv_hash=ident.argv_hash,
+                launch_nonce=ident.launch_nonce,
+            )
 
         log_dir = self.data_root / "logs" / "mimo"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -206,12 +221,20 @@ class MimoRunner:
                 process = subprocess.Popen(argv, cwd=workspace_path, shell=False, stdout=stdout, stderr=stderr)
             except OSError as error:
                 raise OrchestratorError(f"Mimo headless launch failed: {error}") from error
+        ident = capture_process_identity(process.pid, argv[0] if argv else "", argv)
         self._headless_processes[session_id] = process
         logger.info(
             "[GraceOrchestrator][mimo][HEADLESS_SESSION_LAUNCH] started Mimo headless session",
             extra={"session_id": session_id, "pid": process.pid, "model": model},
         )
-        return MimoLaunchResult(argv, process.pid, stdout_path, stderr_path, detached_tui=False)
+        return MimoLaunchResult(
+            argv, process.pid, stdout_path, stderr_path, detached_tui=False,
+            process_started_at_os=str(ident.process_started_at_os),
+            executable_path=str(ident.executable_path),
+            argv_hash=ident.argv_hash,
+            launch_nonce=ident.launch_nonce,
+        )
+
         # END_BLOCK_LAUNCH_FIXED_ARGV_MIMO_PROCESS
 
     def poll(self, session_id: int) -> int | None:

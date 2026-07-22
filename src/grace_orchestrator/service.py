@@ -28,15 +28,19 @@ import json
 import logging
 import os
 from pathlib import Path, PurePosixPath
+import signal
 import sqlite3
 import sys
 import threading
 import time
 from typing import Any, Mapping, Sequence
+import uuid
 
 from .db import OrchestratorStore
 from .hooks import HookContext, HookEvent, HookRegistry, install_default_hooks
+from .process_identity import ProcessIdentity, ProcessMatchState, capture_process_identity, verify_process_liveness
 from .mimo import (
+
     MimoRunner,
     SHARED_CODEX_BACKEND,
     backend_family,
@@ -260,7 +264,9 @@ class OrchestratorService:
             raise OrchestratorError(f"Unsupported handoff event type: {event_type}")
         run_root, events_path, handoff_dir = self._handoff_paths(project_id, task_id, package_id)
         handoff_dir.mkdir(parents=True, exist_ok=True)
+        event_id = f"evt_{uuid.uuid4().hex}"
         event = {
+            "event_id": event_id,
             "type": event_type,
             "project_id": project_id,
             "task_id": task_id,
@@ -269,6 +275,7 @@ class OrchestratorService:
             "created_at": _now(),
             "payload": dict(payload),
         }
+
         with events_path.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(json.dumps(event, sort_keys=True) + "\n")
             stream.flush()
@@ -1831,6 +1838,41 @@ class OrchestratorService:
                 "ADMINISTRATIVE_RECOVERY_REJECTED: reason must be a descriptive non-empty string (at least 10 characters)"
             )
 
+        # Step 1: Read active sessions outside transaction
+        active_sessions = self.store.fetchall(
+            """SELECT * FROM mimo_sessions 
+               WHERE work_package_id = ? AND lifecycle_state IN (?, ?, ?)""",
+            (
+                package_id,
+                MimoSessionStatus.RUNNING.value,
+                MimoSessionStatus.TUI_DETACHED.value,
+                MimoSessionStatus.PREPARED.value,
+            ),
+        )
+
+        # Step 2: Cancel headless RUNNING processes outside DB transaction
+        for sess in active_sessions:
+            if sess["lifecycle_state"] == MimoSessionStatus.RUNNING.value and sess["mode"] == MimoLaunchMode.HEADLESS.value:
+                try:
+                    self.mimo_runner.cancel(int(sess["id"]))
+                except Exception:
+                    pid = sess.get("pid")
+                    if pid and isinstance(pid, int) and pid > 0:
+                        ident = ProcessIdentity(
+                            pid=pid,
+                            process_started_at_os=str(sess.get("process_started_at_os") or "UNKNOWN"),
+                            executable_path=str(sess.get("executable_path") or ""),
+                            argv_hash=str(sess.get("argv_hash") or ""),
+                            launch_nonce=str(sess.get("launch_nonce") or ""),
+                        )
+                        match_state = verify_process_liveness(ident)
+                        if match_state == ProcessMatchState.MATCH:
+                            try:
+                                os.kill(pid, getattr(signal, "SIGKILL", 9))
+                            except OSError as error:
+                                raise OrchestratorError(f"Failed to cancel headless Mimo process PID {pid} during force reset: {error}")
+
+        # Step 3: Short DB transaction to update states
         with self.store.transaction() as conn:
             pkg = self._package(package_id)
             current_status_str = pkg["status"]
@@ -1840,18 +1882,30 @@ class OrchestratorService:
                     f"OPTIMISTIC_LOCK_MISMATCH: workpackage {package_id} current status is '{current_status_str}', expected '{expected_current_status}'"
                 )
 
-            # Detach any active Mimo session (including TUI_DETACHED) without killing external process
+            # Mark RUNNING and PREPARED sessions as CANCELLED
             conn.execute(
                 """UPDATE mimo_sessions 
                    SET lifecycle_state = ?, ended_at = ? 
-                   WHERE work_package_id = ? AND lifecycle_state IN (?, ?, ?)""",
+                   WHERE work_package_id = ? AND lifecycle_state IN (?, ?)""",
                 (
                     MimoSessionStatus.CANCELLED.value,
                     _now(),
                     package_id,
                     MimoSessionStatus.RUNNING.value,
-                    MimoSessionStatus.TUI_DETACHED.value,
                     MimoSessionStatus.PREPARED.value,
+                ),
+            )
+
+            # Mark TUI_DETACHED sessions as ABANDONED without process kill
+            conn.execute(
+                """UPDATE mimo_sessions 
+                   SET lifecycle_state = ?, ended_at = ? 
+                   WHERE work_package_id = ? AND lifecycle_state = ?""",
+                (
+                    MimoSessionStatus.ABANDONED.value,
+                    _now(),
+                    package_id,
+                    MimoSessionStatus.TUI_DETACHED.value,
                 ),
             )
 
@@ -1862,6 +1916,7 @@ class OrchestratorService:
                    WHERE id = ?""",
                 (WorkPackageStatus.CREATED.value, _now(), package_id),
             )
+
 
             self._audit(
                 conn,
@@ -2750,19 +2805,24 @@ class OrchestratorService:
         with self.store.transaction() as conn:
             conn.execute(
                 """UPDATE mimo_sessions SET lifecycle_state = ?, workspace_path = ?, briefing_path = ?,
-                   command_json = ?, pid = ?, stdout_path = ?, stderr_path = ?, started_at = ? WHERE id = ?""",
+                   command_json = ?, pid = ?, process_started_at_os = ?, executable_path = ?, argv_hash = ?, launch_nonce = ?, stdout_path = ?, stderr_path = ?, started_at = ? WHERE id = ?""",
                 (
                     state.value,
                     str(created_workspace),
                     str(briefing_path),
                     _json(launch.argv),
                     launch.pid,
+                    launch.process_started_at_os,
+                    launch.executable_path,
+                    launch.argv_hash,
+                    launch.launch_nonce,
                     str(launch.stdout_path) if launch.stdout_path else None,
                     str(launch.stderr_path) if launch.stderr_path else None,
                     _now(),
                     session_id,
                 ),
             )
+
             self._audit(
                 conn,
                 actor,
@@ -2889,8 +2949,19 @@ class OrchestratorService:
         pid = session["pid"]
         if not isinstance(pid, int) or pid <= 0:
             raise OrchestratorError("Running Mimo recovery requires a persisted process ID")
-        if _process_exists(pid):
+        ident = ProcessIdentity(
+            pid=pid,
+            process_started_at_os=str(session.get("process_started_at_os") or "UNKNOWN"),
+            executable_path=str(session.get("executable_path") or ""),
+            argv_hash=str(session.get("argv_hash") or ""),
+            launch_nonce=str(session.get("launch_nonce") or ""),
+        )
+        match_state = verify_process_liveness(ident)
+        if match_state == ProcessMatchState.MATCH:
             raise OrchestratorError("Running Mimo recovery requires an observed absent process")
+        elif match_state == ProcessMatchState.UNKNOWN:
+            raise OrchestratorError("Running Mimo recovery cannot proceed while process liveness is UNKNOWN")
+
         if not observation.strip():
             raise OrchestratorError("Running Mimo recovery requires a non-empty controller observation")
         with self.store.transaction() as conn:
@@ -3300,7 +3371,7 @@ class OrchestratorService:
             "updated_at": pkg["updated_at"],
         }
 
-    def list_handoff_events_page(self, work_package_id: int, after_event_id: int = 0, limit: int = 20) -> dict[str, Any]:
+    def list_handoff_events_page(self, work_package_id: int, after_event_id: str | None = None, limit: int = 20) -> dict[str, Any]:
         """Paginated event retrieval for work package handoffs."""
         clamped_limit = max(1, min(limit, 200))
         package = self._package(work_package_id)
@@ -3315,19 +3386,34 @@ class OrchestratorService:
                 "limit": clamped_limit,
             }
 
-        all_events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        raw_lines = [line for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        events = []
+        for idx, line in enumerate(raw_lines, start=1):
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(evt, dict):
+                if "event_id" not in evt:
+                    evt["event_id"] = f"legacy_evt_{idx}"
+                events.append(evt)
 
-        filtered = []
-        for idx, evt in enumerate(all_events, start=1):
-            evt_id = evt.get("event_id", idx)
-            if isinstance(evt_id, int) and evt_id > after_event_id:
-                filtered.append(evt)
-            elif idx > after_event_id:
-                filtered.append(evt)
+        start_idx = 0
+        if after_event_id and str(after_event_id).strip():
+            cursor = str(after_event_id).strip()
+            found_idx = None
+            for i, evt in enumerate(events):
+                if str(evt.get("event_id")) == cursor or str(i + 1) == cursor:
+                    found_idx = i
+                    break
+            if found_idx is None:
+                raise OrchestratorError(f"Unknown after_event_id cursor: {after_event_id!r}")
+            start_idx = found_idx + 1
 
-        has_more = len(filtered) > clamped_limit
-        items = filtered[:clamped_limit]
-        next_after_id = after_event_id + len(items) if items else None
+        remaining = events[start_idx:]
+        has_more = len(remaining) > clamped_limit
+        items = remaining[:clamped_limit]
+        next_after_id = items[-1]["event_id"] if items and has_more else None
 
         return {
             "items": items,
@@ -3335,6 +3421,7 @@ class OrchestratorService:
             "next_after_id": next_after_id,
             "limit": clamped_limit,
         }
+
 
     def list_audit_page(self, task_id: int | None = None, after_audit_id: int = 0, limit: int = 20) -> dict[str, Any]:
         """Paginated audit log retrieval."""
@@ -3372,12 +3459,15 @@ class OrchestratorService:
         actor: ActorIdentity,
         continuation_id: str,
         source_event_id: str,
-        attempt_id: str | None = None,
+        attempt_id: str,
         controller_session_id: str | None = None,
     ) -> dict[str, Any]:
         """Idempotently acknowledge adoption of a continuation by a revived controller."""
         if actor.primary_role not in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
             raise OrchestratorError("Only USER or CODEX may acknowledge continuations")
+
+        if not attempt_id or not attempt_id.strip():
+            raise OrchestratorError("attempt_id is required and cannot be empty")
 
         with self.store.transaction() as conn:
             row = conn.execute(
@@ -3391,10 +3481,12 @@ class OrchestratorService:
             if deliv["source_event_id"] != source_event_id:
                 raise OrchestratorError(f"Continuation source event mismatch for {continuation_id}")
 
-            if attempt_id and deliv.get("attempt_id") and deliv["attempt_id"] != attempt_id:
+            if deliv.get("attempt_id") and deliv["attempt_id"] != attempt_id:
                 raise ConflictError(f"Continuation attempt_id mismatch for {continuation_id}: expected {deliv.get('attempt_id')!r}, got {attempt_id!r}")
 
             if deliv["state"] == "ACKNOWLEDGED":
+                if deliv.get("attempt_id") and deliv["attempt_id"] != attempt_id:
+                    raise ConflictError("Idempotent ACK mismatch: attempt_id differs")
                 if controller_session_id and deliv.get("controller_session_id") and deliv["controller_session_id"] != controller_session_id:
                     raise ConflictError("Idempotent ACK mismatch: controller_session_id differs")
                 return deliv
@@ -3406,12 +3498,18 @@ class OrchestratorService:
                 raise ConflictError(f"Cannot ACK continuation in state {deliv['state']!r}")
 
             timestamp = _now()
-            conn.execute(
+            cursor = conn.execute(
                 """UPDATE continuation_deliveries 
                    SET state = ?, acknowledged_at = ?, controller_session_id = ? 
-                   WHERE continuation_id = ?""",
-                ("ACKNOWLEDGED", timestamp, controller_session_id, continuation_id),
+                   WHERE continuation_id = ? AND source_event_id = ? AND attempt_id = ? AND state IN ('CONTROLLER_STARTED', 'CLAIMED')""",
+                ("ACKNOWLEDGED", timestamp, controller_session_id, continuation_id, source_event_id, attempt_id),
             )
+            if cursor.rowcount == 0:
+                rec = conn.execute("SELECT * FROM continuation_deliveries WHERE continuation_id = ?", (continuation_id,)).fetchone()
+                if rec and rec["state"] == "ACKNOWLEDGED":
+                    return dict(rec)
+                raise ConflictError(f"Failed to ACK continuation delivery {continuation_id} due to concurrent state update")
+
             self._audit(
                 conn,
                 actor,
@@ -3428,13 +3526,16 @@ class OrchestratorService:
         actor: ActorIdentity,
         continuation_id: str,
         source_event_id: str,
-        attempt_id: str | None = None,
+        attempt_id: str,
         resolution_notes: str = "",
         resolution_data: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Resolve a continuation delivery after successful action or terminal outcome."""
         if actor.primary_role not in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
             raise OrchestratorError("Only USER or CODEX may resolve continuations")
+
+        if not attempt_id or not attempt_id.strip():
+            raise OrchestratorError("attempt_id is required and cannot be empty")
 
         with self.store.transaction() as conn:
             row = conn.execute(
@@ -3448,8 +3549,8 @@ class OrchestratorService:
             if deliv["source_event_id"] != source_event_id:
                 raise OrchestratorError(f"Continuation source event mismatch for {continuation_id}")
 
-            if attempt_id and deliv.get("attempt_id") and deliv["attempt_id"] != attempt_id:
-                raise ConflictError(f"Continuation attempt_id mismatch for {continuation_id}")
+            if deliv.get("attempt_id") and deliv["attempt_id"] != attempt_id:
+                raise ConflictError(f"Continuation attempt_id mismatch for {continuation_id}: expected {deliv.get('attempt_id')!r}, got {attempt_id!r}")
 
             if deliv["state"] == "RESOLVED":
                 return deliv
@@ -3459,12 +3560,18 @@ class OrchestratorService:
 
             timestamp = _now()
             res_json = _json(dict(resolution_data or {"notes": resolution_notes}))
-            conn.execute(
+            cursor = conn.execute(
                 """UPDATE continuation_deliveries 
                    SET state = ?, resolved_at = ?, resolution_json = ? 
-                   WHERE continuation_id = ?""",
-                ("RESOLVED", timestamp, res_json, continuation_id),
+                   WHERE continuation_id = ? AND source_event_id = ? AND attempt_id = ? AND state = 'ACKNOWLEDGED'""",
+                ("RESOLVED", timestamp, res_json, continuation_id, source_event_id, attempt_id),
             )
+            if cursor.rowcount == 0:
+                rec = conn.execute("SELECT * FROM continuation_deliveries WHERE continuation_id = ?", (continuation_id,)).fetchone()
+                if rec and rec["state"] == "RESOLVED":
+                    return dict(rec)
+                raise ConflictError(f"Failed to resolve continuation delivery {continuation_id} due to concurrent state update")
+
             self._audit(
                 conn,
                 actor,
@@ -3475,6 +3582,7 @@ class OrchestratorService:
                 {"continuation_id": continuation_id, "notes": resolution_notes},
             )
             return dict(conn.execute("SELECT * FROM continuation_deliveries WHERE continuation_id = ?", (continuation_id,)).fetchone())
+
 
     def get_continuation(self, continuation_id: str) -> dict[str, Any]:
         """Fetch details of a continuation delivery record."""
@@ -3528,7 +3636,51 @@ class OrchestratorService:
             )
             return dict(conn.execute("SELECT * FROM continuation_deliveries WHERE continuation_id = ?", (continuation_id,)).fetchone())
 
+    def get_submission(self, actor: ActorIdentity, submission_id: int) -> dict[str, Any]:
+        """Fetch submission record with strict role authorization."""
+        row = self.store.fetchone("SELECT * FROM submissions WHERE id = ?", (submission_id,))
+        if row is None:
+            raise OrchestratorError(f"Submission not found: {submission_id}")
+        sub = dict(row)
+        pkg = self._package(sub["work_package_id"])
+        task = self._task(pkg["task_id"])
+        if actor.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+            if sub.get("worker_agent") != actor.name and pkg.get("claimed_by_agent") != actor.name:
+                raise OrchestratorError(f"Worker {actor.name} is not authorized to read submission {submission_id}")
+        elif actor.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+            self._authorize(actor, OrchestratorRole.GLM, task["project_id"], task["id"])
+        return sub
+
+    def get_review(self, actor: ActorIdentity, review_id: int) -> dict[str, Any]:
+        """Fetch review record with strict role authorization."""
+        if actor.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+            raise OrchestratorError(f"Worker role {actor.primary_role.value} is not authorized to read review resources")
+        row = self.store.fetchone("SELECT * FROM reviews WHERE id = ?", (review_id,))
+        if row is None:
+            raise OrchestratorError(f"Review not found: {review_id}")
+        rev = dict(row)
+        task = self._task(rev["task_id"])
+        if actor.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+            self._authorize(actor, OrchestratorRole.GLM, task["project_id"], task["id"])
+        return rev
+
+    def get_latest_grace_artifact(self, actor: ActorIdentity, project_id: int, artifact_type: str) -> str:
+        """Fetch latest GRACE artifact content with strict role authorization."""
+        if actor.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+            raise OrchestratorError(f"Worker role {actor.primary_role.value} is not authorized to read GRACE artifacts")
+        if actor.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+            self._authorize(actor, OrchestratorRole.GLM, project_id)
+        row = self.store.fetchone(
+            """SELECT content FROM grace_artifacts WHERE project_id = ? AND artifact_type = ?
+               ORDER BY revision DESC LIMIT 1""",
+            (project_id, artifact_type),
+        )
+        if row is None:
+            raise OrchestratorError(f"No {artifact_type} artifact has been registered for project {project_id}")
+        return str(row["content"])
+
     def close(self) -> None:
+
         """Close the underlying ledger store connection."""
         self.store.close()
 

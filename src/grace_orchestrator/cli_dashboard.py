@@ -94,10 +94,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     raw_data_dir = args.data_dir or os.environ.get("GRACE_ORCHESTRATOR_DATA_DIR", "./data")
     data_dir = Path(raw_data_dir).resolve()
 
-    if not data_dir.exists():
+    if not data_dir.exists() and not data_dir.name.endswith(".sqlite3"):
         data_dir.mkdir(parents=True, exist_ok=True)
 
-    service = OrchestratorService(data_dir)
+    db_path = data_dir if data_dir.is_file() or data_dir.name.endswith(".sqlite3") else data_dir / "ledger.sqlite3"
+    service = OrchestratorService(db_path)
+
+
 
     try:
         while True:

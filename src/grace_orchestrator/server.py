@@ -40,6 +40,7 @@ from .prompts import (
     pro_repair_package_prompt,
     worker_implement_package_prompt,
 )
+from .policy import project_next_action
 from .repo import RepositoryBoundary
 from .resources import GRACE_ARTIFACT_TYPES, RESOURCE_URIS
 from .service import OrchestratorService
@@ -121,8 +122,6 @@ WORKER_TOOLS = frozenset({
     "workpackage.get_summary",
     "task.get_summary",
     "submission.create",
-    "submission.controller_repair",
-    "handoff.list_events",
     "handoff.list_events_page",
     "handoff.report_worker_event",
     "audit.list",
@@ -130,11 +129,9 @@ WORKER_TOOLS = frozenset({
     "repo.status",
     "repo.diff",
     "repo.run_tests",
-    "grace.upsert_artifact",
-    "gate.contract_discovery",
-    "gate.validate_execution_packet",
     "gate.validate_worker_report",
 })
+
 
 REQUIRED_TOOLS_BY_ROLE: dict[OrchestratorRole, frozenset[str]] = {
     OrchestratorRole.USER: ALL_REQUIRED_TOOLS,
@@ -154,23 +151,7 @@ def _plain(value: Any) -> Any:
     return json.loads(json.dumps(value, default=str))
 
 
-def _next_action(status: str) -> dict[str, str]:
-    actions = {
-        "CODEX_TASK_CREATED": {"role": "glm", "action": "task.plan"},
-        "GLM_GRACE_PLANNED": {"role": "glm", "action": "verification.register_plan or submission.controller_task_completion"},
-        "GLM_TESTS_PREPARED": {"role": "glm", "action": "workpackage.create or submission.controller_task_completion"},
-        "WORK_PACKAGES_CREATED": {"role": "glm", "action": "workpackage.assign"},
-        "WORK_PACKAGES_ASSIGNED": {"role": "worker_junior", "action": "workpackage.claim"},
-        "GLM_REJECTED_REPAIR_REQUIRED": {"role": "glm", "action": "mimo.launch_package or submission.controller_repair"},
-        "GLM_ACCEPTED": {
-            "role": "glm_or_codex",
-            "action": "GLM workpackage.create for the next wave, or Codex task.request_final_review only after the full DAG is exhausted",
-        },
-        "CODEX_FINAL_REVIEW": {"role": "codex", "action": "review.codex_submit"},
-        "CODEX_ACCEPTED": {"role": "codex", "action": "task.close"},
-        "TASK_CLOSED": {"role": "codex", "action": "task.next"},
-    }
-    return actions.get(status, {"role": "none", "action": "blocked"})
+
 
 
 def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
@@ -327,7 +308,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     @tool_decorator("task.get_next_action", description="Project the next valid gate without changing state.")
     def get_next_action(task_id: int) -> dict[str, Any]:
         task = service.get_task(task_id)
-        next_step = _next_action(task["status"])
+        next_step = project_next_action(task["status"], task.get("work_packages"))
         blocked_reason = None
         if next_step["role"] not in {"none", "glm_or_codex", actor.primary_role.value}:
             try:
@@ -335,6 +316,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             except OrchestratorError as error:
                 blocked_reason = str(error)
         return _plain({"current_state": task["status"], "next": next_step, "blocked_reason": blocked_reason})
+
 
     @tool_decorator("task.request_final_review", description="Advance an all-GLM-accepted task to Codex final review.")
     def request_final_review(task_id: int) -> dict[str, Any]:
@@ -566,7 +548,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     def ack_continuation(
         continuation_id: str,
         source_event_id: str,
-        attempt_id: str | None = None,
+        attempt_id: str,
         controller_session_id: str | None = None,
     ) -> dict[str, Any]:
         return _plain(
@@ -574,7 +556,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
                 actor,
                 continuation_id,
                 source_event_id,
-                attempt_id=attempt_id,
+                attempt_id,
                 controller_session_id=controller_session_id,
             )
         )
@@ -583,7 +565,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     def resolve_continuation(
         continuation_id: str,
         source_event_id: str,
-        attempt_id: str | None = None,
+        attempt_id: str,
         resolution_notes: str = "",
         resolution_data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -592,11 +574,12 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
                 actor,
                 continuation_id,
                 source_event_id,
-                attempt_id=attempt_id,
+                attempt_id,
                 resolution_notes=resolution_notes,
                 resolution_data=resolution_data,
             )
         )
+
 
     @tool_decorator("continuation.get", description="Fetch details of a continuation delivery record.")
     def get_continuation(continuation_id: str) -> dict[str, Any]:
@@ -786,26 +769,46 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     def list_audit_page(task_id: int | None = None, after_audit_id: int = 0, limit: int = 20) -> dict[str, Any]:
         return _plain(service.list_audit_page(task_id=task_id, after_audit_id=after_audit_id, limit=limit))
 
-    @mcp.resource("orchestrator://project/{project_id}", mime_type="application/json")
-    def project_resource(project_id: int) -> str:
-        return json.dumps(service.get_project(project_id), default=str)
+    def artifact_resource_for(artifact_type: str):
+        def artifact_resource(project_id: int) -> str:
+            return service.get_latest_grace_artifact(actor, project_id, artifact_type)
 
-    @mcp.resource("orchestrator://project/{project_id}/active", mime_type="application/json")
-    def project_active_resource(project_id: int) -> str:
-        snapshot = service.get_orchestrator_status_snapshot(project_id=project_id)
-        return json.dumps(snapshot, default=str)
+        return artifact_resource
 
-    @mcp.resource("orchestrator://task/{task_id}", mime_type="application/json")
-    def task_resource(task_id: int) -> str:
-        return json.dumps(service.get_task(task_id), default=str)
+    role = actor.primary_role
+    if role in {OrchestratorRole.USER, OrchestratorRole.CODEX, OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+        @mcp.resource("orchestrator://project/{project_id}", mime_type="application/json")
+        def project_resource(project_id: int) -> str:
+            return json.dumps(service.get_project(project_id), default=str)
+
+        @mcp.resource("orchestrator://project/{project_id}/active", mime_type="application/json")
+        def project_active_resource(project_id: int) -> str:
+            snapshot = service.get_orchestrator_status_snapshot(project_id=project_id)
+            return json.dumps(snapshot, default=str)
+
+        @mcp.resource("orchestrator://task/{task_id}", mime_type="application/json")
+        def task_resource(task_id: int) -> str:
+            return json.dumps(service.get_task(task_id), default=str)
+
+        @mcp.resource("orchestrator://workpackage/{work_package_id}", mime_type="application/json")
+        def work_package_resource(work_package_id: int) -> str:
+            return json.dumps(service.get_work_package(work_package_id), default=str)
+
+        @mcp.resource("orchestrator://review/{review_id}", mime_type="application/json")
+        def review_resource(review_id: int) -> str:
+            return json.dumps(service.get_review(actor, review_id), default=str)
+
+        @mcp.resource("orchestrator://mimo-session/{session_id}", mime_type="application/json")
+        def mimo_session_resource(session_id: int) -> str:
+            return json.dumps(service.get_mimo_session(session_id), default=str)
+
+        for filename, artifact_type in GRACE_ARTIFACT_TYPES.items():
+            uri = f"grace://project/{{project_id}}/{filename}"
+            mcp.resource(uri, mime_type="application/xml")(artifact_resource_for(artifact_type))
 
     @mcp.resource("orchestrator://task/{task_id}/summary", mime_type="application/json")
     def task_summary_resource(task_id: int) -> str:
         return json.dumps(service.get_task_summary(task_id), default=str)
-
-    @mcp.resource("orchestrator://workpackage/{work_package_id}", mime_type="application/json")
-    def work_package_resource(work_package_id: int) -> str:
-        return json.dumps(service.get_work_package(work_package_id), default=str)
 
     @mcp.resource("orchestrator://workpackage/{work_package_id}/summary", mime_type="application/json")
     def work_package_summary_resource(work_package_id: int) -> str:
@@ -813,34 +816,8 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
 
     @mcp.resource("orchestrator://submission/{submission_id}", mime_type="application/json")
     def submission_resource(submission_id: int) -> str:
-        row = service.store.connection.execute("SELECT * FROM submissions WHERE id = ?", (submission_id,)).fetchone()
-        return json.dumps(dict(row) if row else {"error": "not_found"}, default=str)
+        return json.dumps(service.get_submission(actor, submission_id), default=str)
 
-    @mcp.resource("orchestrator://review/{review_id}", mime_type="application/json")
-    def review_resource(review_id: int) -> str:
-        row = service.store.connection.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()
-        return json.dumps(dict(row) if row else {"error": "not_found"}, default=str)
-
-    @mcp.resource("orchestrator://mimo-session/{session_id}", mime_type="application/json")
-    def mimo_session_resource(session_id: int) -> str:
-        return json.dumps(service.get_mimo_session(session_id), default=str)
-
-    def artifact_resource_for(artifact_type: str):
-        def artifact_resource(project_id: int) -> str:
-            row = service.store.connection.execute(
-                """SELECT content FROM grace_artifacts WHERE project_id = ? AND artifact_type = ?
-                   ORDER BY revision DESC LIMIT 1""",
-                (project_id, artifact_type),
-            ).fetchone()
-            if row is None:
-                raise OrchestratorError(f"No {artifact_type} artifact has been registered for project {project_id}")
-            return str(row["content"])
-
-        return artifact_resource
-
-    for filename, artifact_type in GRACE_ARTIFACT_TYPES.items():
-        uri = f"grace://project/{{project_id}}/{filename}"
-        mcp.resource(uri, mime_type="application/xml")(artifact_resource_for(artifact_type))
 
     @mcp.prompt("codex_create_task")
     def codex_create_task() -> str:

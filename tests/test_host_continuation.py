@@ -254,7 +254,7 @@ def test_host_builds_controller_prompt_from_durable_run_data(tmp_path: Path, mon
     assert "review.glm_submit" in prompt
 
 
-def test_host_continuation_skips_malformed_ndjson_line(tmp_path: Path) -> None:
+def test_host_continuation_dispatches_after_malformed_ndjson_line(tmp_path: Path, monkeypatch) -> None:
     service, _project, _task, package, junior, _glm = _ready_package(tmp_path)
     submission = _submit(service, junior, package["id"])
     run_root = Path(submission["handoff_event"]["run_root"])
@@ -269,3 +269,17 @@ def test_host_continuation_skips_malformed_ndjson_line(tmp_path: Path) -> None:
     assert len(parsed_events) >= 2
     types = [evt[1]["type"] for evt in parsed_events]
     assert "INVALID_EVENT_JSON" in types
+
+    marker = tmp_path / "controller-started-after-corrupt-line.txt"
+    monkeypatch.setenv("GRACE_TEST_MARKER", str(marker))
+    result = HostContinuationSupervisor(
+        HostContinuationConfig(
+            data_dir=tmp_path,
+            start_command=_start_command(tmp_path),
+            command_wait_seconds=2,
+        )
+    ).run_once()
+
+    assert result["processed_count"] == 1
+    assert marker.is_file()
+    assert "Continue GRACE controller review" in marker.read_text(encoding="utf-8")

@@ -333,6 +333,13 @@ class OrchestratorService:
             )
         ]
 
+    def _is_registered_in_project(self, actor_name: str, project_id: int) -> bool:
+        row = self.store.fetchone(
+            "SELECT availability FROM agents WHERE project_id = ? AND name = ?",
+            (project_id, actor_name),
+        )
+        return row is not None and row["availability"] == "available"
+
     def _authorize(
         self,
         actor: ActorIdentity,
@@ -340,6 +347,12 @@ class OrchestratorService:
         project_id: int,
         task_id: int | None = None,
     ) -> OrchestratorRole:
+        if actor.primary_role == required_role:
+            if actor.primary_role in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
+                return required_role
+            if self._is_registered_in_project(actor.name, project_id):
+                return required_role
+
         return authorize_role(actor, required_role, self._delegations(project_id, task_id))
 
     def _is_authorized_for_project(
@@ -349,26 +362,31 @@ class OrchestratorService:
         required_role: OrchestratorRole | None = None,
         task_id: int | None = None,
     ) -> bool:
-        if actor.primary_role in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
-            return True
         role_to_check = required_role or actor.primary_role
 
-        # Check explicit active delegation
+        if role_to_check == actor.primary_role:
+            if actor.primary_role in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
+                return True
+            if self._is_registered_in_project(actor.name, project_id):
+                return True
+
+        now = datetime.now(UTC)
         delegations = self._delegations(project_id, task_id)
         for delegation in delegations:
             if delegation.get("substitute_actor") == actor.name:
-                if delegation.get("delegated_role") == role_to_check.value and delegation.get("revoked_at") is None:
-                    return True
-
-        # Check registered agent capability in project
-        try:
-            agent = self.get_agent(project_id, actor.name)
-            if agent and agent.get("availability") == "available":
-                capabilities = set(agent.get("capabilities") or [])
-                if role_to_check.value in capabilities or agent.get("primary_role") == role_to_check.value:
-                    return True
-        except OrchestratorError:
-            pass
+                if delegation.get("delegated_role") == role_to_check.value:
+                    if delegation.get("revoked_at") is not None:
+                        continue
+                    expires_at = delegation.get("expires_at")
+                    if isinstance(expires_at, str):
+                        try:
+                            expiry = datetime.fromisoformat(expires_at)
+                            if expiry.tzinfo is None:
+                                expiry = expiry.replace(tzinfo=UTC)
+                            if expiry > now:
+                                return True
+                        except ValueError:
+                            pass
 
         return False
 
@@ -3329,14 +3347,56 @@ class OrchestratorService:
         }
 
     def _clamp_envelope_size(self, env: dict[str, Any]) -> dict[str, Any]:
-        payload_bytes = json.dumps(env, default=str).encode("utf-8")
-        if len(payload_bytes) <= 4096:
+        def _utf8_size(obj: dict[str, Any]) -> int:
+            return len(json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8"))
+
+        if _utf8_size(env) <= 4096:
             return env
-        env_copy = dict(env)
-        context = dict(env_copy.get("context") or {})
-        if "contract_discovery" in context:
-            context["contract_discovery"] = "truncated_for_compact_envelope"
-        env_copy["context"] = context
+
+        env_copy = json.loads(json.dumps(env, default=str))
+
+        # 1. Truncate long objective string at envelope level
+        if isinstance(env_copy.get("objective"), str) and len(env_copy["objective"]) > 100:
+            env_copy["objective"] = env_copy["objective"][:100] + "..."
+        if _utf8_size(env_copy) <= 4096:
+            return env_copy
+
+        # 2. Compact context
+        ctx = env_copy.get("context")
+        if isinstance(ctx, dict):
+            if "contract_discovery" in ctx:
+                ctx["contract_discovery"] = "truncated"
+            if _utf8_size(env_copy) <= 4096:
+                return env_copy
+
+            for key in ("allowed_files", "forbidden_files", "test_surface", "commands_allowed", "compact_report_requirements"):
+                if key in ctx and isinstance(ctx[key], (list, dict)):
+                    ctx[key] = f"[{len(ctx[key])} items]"
+            if _utf8_size(env_copy) <= 4096:
+                return env_copy
+
+            for key in ("task_objective", "package_objective", "architecture_intent"):
+                if key in ctx and isinstance(ctx[key], str) and len(ctx[key]) > 50:
+                    ctx[key] = ctx[key][:50] + "..."
+            if _utf8_size(env_copy) <= 4096:
+                return env_copy
+
+            env_copy["context"] = {"compact": True}
+            if _utf8_size(env_copy) <= 4096:
+                return env_copy
+
+        # 3. Truncate item-level strings if still > 4096
+        if isinstance(env_copy.get("objective"), str):
+            env_copy["objective"] = env_copy["objective"][:30] + "..."
+        if isinstance(env_copy.get("title"), str) and len(env_copy["title"]) > 50:
+            env_copy["title"] = env_copy["title"][:50] + "..."
+
+        if _utf8_size(env_copy) > 4096:
+            env_copy.pop("objective", None)
+
+        if _utf8_size(env_copy) > 4096:
+            raise OrchestratorError(f"Envelope size ({_utf8_size(env_copy)} bytes) exceeds maximum limit of 4096 UTF-8 bytes")
+
         return env_copy
 
     def inbox_next(self, actor: ActorIdentity, project_id: int | None = None) -> dict[str, Any]:
@@ -3362,7 +3422,7 @@ class OrchestratorService:
             task = self._task(int(pkg["task_id"]))
             proj_id = int(task["project_id"])
             proj = self._project(proj_id)
-            item_id = f"wp-{pkg['id']}-{pkg['status']}"
+            item_id = f"work-package:{pkg['id']}"
             env = {
                 "item_id": item_id,
                 "kind": "work_package",
@@ -3394,7 +3454,7 @@ class OrchestratorService:
                 task = self._task(int(pkg["task_id"]))
                 proj_id = int(task["project_id"])
                 proj = self._project(proj_id)
-                item_id = f"wp-{pkg['id']}-{pkg['status']}"
+                item_id = f"work-package:{pkg['id']}"
                 env = {
                     "item_id": item_id,
                     "kind": "work_package",
@@ -3426,15 +3486,7 @@ class OrchestratorService:
             proj_id = int(task["project_id"])
             proj = self._project(proj_id)
             if self._is_authorized_for_project(actor, proj_id, OrchestratorRole.GLM, task_id=task["id"]):
-                if actor.primary_role == OrchestratorRole.TEST_OWNER:
-                    try:
-                        agent = self.get_agent(proj_id, actor.name)
-                        caps = set(agent.get("capabilities") or [])
-                        if OrchestratorRole.GLM.value not in caps and not self._is_delegated_codex(actor, proj_id):
-                            continue
-                    except OrchestratorError:
-                        continue
-                item_id = f"rev-{pkg['id']}-{pkg['status']}"
+                item_id = f"work-package:{pkg['id']}"
                 env = {
                     "item_id": item_id,
                     "kind": "package_review",
@@ -3456,36 +3508,35 @@ class OrchestratorService:
                 candidates.append((3, pkg["updated_at"], f"wp-{pkg['id']}", self._clamp_envelope_size(env)))
 
         # Priority 4: Codex final review
-        if actor.primary_role == OrchestratorRole.CODEX or (actor.primary_role == OrchestratorRole.USER and self._is_delegated_codex(actor, project_id)):
-            sql_final = "SELECT * FROM tasks WHERE status IN ('GLM_ACCEPTED', 'CODEX_FINAL_REVIEW')"
-            params_final: list[Any] = []
-            if project_id is not None:
-                sql_final += " AND project_id = ?"
-                params_final.append(project_id)
-            for t in [dict(r) for r in self.store.fetchall(sql_final, tuple(params_final))]:
-                proj_id = int(t["project_id"])
-                if self._is_authorized_for_project(actor, proj_id, OrchestratorRole.CODEX, task_id=t["id"]):
-                    tool_name = "task.request_final_review" if t["status"] == "GLM_ACCEPTED" else "review.codex_submit"
-                    item_id = f"final-{t['id']}-{t['status']}"
-                    env = {
-                        "item_id": item_id,
-                        "kind": "final_review",
-                        "project_id": proj_id,
-                        "task_id": t["id"],
-                        "work_package_id": None,
-                        "current_state": t["status"],
-                        "assigned_actor": actor.name,
-                        "assigned_role": OrchestratorRole.CODEX.value,
-                        "title": t["title"],
-                        "objective": t["objective"],
-                        "next_action": {
-                            "tool": tool_name,
-                            "arguments": {"task_id": t["id"]},
-                        },
-                        "context": {"task_title": t["title"]},
-                        "updated_at": t["updated_at"],
-                    }
-                    candidates.append((4, t["updated_at"], f"task-{t['id']}", self._clamp_envelope_size(env)))
+        sql_final = "SELECT * FROM tasks WHERE status IN ('GLM_ACCEPTED', 'CODEX_FINAL_REVIEW')"
+        params_final: list[Any] = []
+        if project_id is not None:
+            sql_final += " AND project_id = ?"
+            params_final.append(project_id)
+        for t in [dict(r) for r in self.store.fetchall(sql_final, tuple(params_final))]:
+            proj_id = int(t["project_id"])
+            if self._is_authorized_for_project(actor, proj_id, OrchestratorRole.CODEX, task_id=t["id"]):
+                tool_name = "task.request_final_review" if t["status"] == "GLM_ACCEPTED" else "review.codex_submit"
+                item_id = f"task:{t['id']}:final-review"
+                env = {
+                    "item_id": item_id,
+                    "kind": "final_review",
+                    "project_id": proj_id,
+                    "task_id": t["id"],
+                    "work_package_id": None,
+                    "current_state": t["status"],
+                    "assigned_actor": actor.name,
+                    "assigned_role": OrchestratorRole.CODEX.value,
+                    "title": t["title"],
+                    "objective": t["objective"],
+                    "next_action": {
+                        "tool": tool_name,
+                        "arguments": {"task_id": t["id"]},
+                    },
+                    "context": {"task_title": t["title"]},
+                    "updated_at": t["updated_at"],
+                }
+                candidates.append((4, t["updated_at"], f"task-{t['id']}", self._clamp_envelope_size(env)))
 
         # Priority 5: New worker assignment
         sql_assigned = "SELECT * FROM work_packages WHERE status = 'ASSIGNED' AND assigned_junior_agent = ?"
@@ -3497,7 +3548,7 @@ class OrchestratorService:
             task = self._task(int(pkg["task_id"]))
             proj_id = int(task["project_id"])
             proj = self._project(proj_id)
-            item_id = f"wp-{pkg['id']}-{pkg['status']}"
+            item_id = f"work-package:{pkg['id']}"
             env = {
                 "item_id": item_id,
                 "kind": "work_package",
@@ -3528,7 +3579,7 @@ class OrchestratorService:
             proj_id = int(t["project_id"])
             if self._is_authorized_for_project(actor, proj_id, OrchestratorRole.GLM, task_id=t["id"]):
                 tool_name = "task.plan" if t["status"] == "CODEX_TASK_CREATED" else "verification.register_plan"
-                item_id = f"gate-{t['id']}-{t['status']}"
+                item_id = f"task:{t['id']}:planning"
                 env = {
                     "item_id": item_id,
                     "kind": "task_gate",
@@ -3558,7 +3609,7 @@ class OrchestratorService:
             task = self._task(int(pkg["task_id"]))
             proj_id = int(task["project_id"])
             if self._is_authorized_for_project(actor, proj_id, OrchestratorRole.GLM, task_id=task["id"]):
-                item_id = f"wp-{pkg['id']}-{pkg['status']}"
+                item_id = f"work-package:{pkg['id']}"
                 env = {
                     "item_id": item_id,
                     "kind": "task_gate",
@@ -3587,7 +3638,7 @@ class OrchestratorService:
                 sql_interv_t += " AND project_id = ?"
                 params_interv_t.append(project_id)
             for t in [dict(r) for r in self.store.fetchall(sql_interv_t, tuple(params_interv_t))]:
-                item_id = f"interv-t-{t['id']}"
+                item_id = f"task:{t['id']}:intervention"
                 env = {
                     "item_id": item_id,
                     "kind": "intervention",
@@ -3615,7 +3666,7 @@ class OrchestratorService:
                 params_interv_wp.append(project_id)
             for pkg in [dict(r) for r in self.store.fetchall(sql_interv_wp, tuple(params_interv_wp))]:
                 task = self._task(int(pkg["task_id"]))
-                item_id = f"interv-wp-{pkg['id']}"
+                item_id = f"work-package:{pkg['id']}:intervention"
                 env = {
                     "item_id": item_id,
                     "kind": "intervention",
@@ -3807,13 +3858,15 @@ class OrchestratorService:
             rows = self.store.fetchall("SELECT * FROM audit_log ORDER BY id")
         else:
             rows = self.store.fetchall(
-                """SELECT * FROM audit_log WHERE (target_type = 'task' AND target_id = ?)
-                   OR target_id IN (SELECT id FROM work_packages WHERE task_id = ?)
-                   OR target_id IN (SELECT id FROM submissions WHERE work_package_id IN (SELECT id FROM work_packages WHERE task_id = ?))
-                   OR target_id IN (SELECT id FROM reviews WHERE target_type = 'task' AND target_id = ?)
-                   OR target_id IN (SELECT id FROM mimo_sessions WHERE task_id = ?)
-                   ORDER BY id""",
-                (tid, tid, tid, tid, tid),
+                """SELECT * FROM audit_log WHERE
+                    (target_type = 'task' AND target_id = ?)
+                    OR (target_type = 'work_package' AND target_id IN (SELECT id FROM work_packages WHERE task_id = ?))
+                    OR (target_type = 'submission' AND target_id IN (SELECT id FROM submissions WHERE work_package_id IN (SELECT id FROM work_packages WHERE task_id = ?)))
+                    OR (target_type = 'review' AND target_id IN (SELECT id FROM reviews WHERE (target_type = 'task' AND target_id = ?) OR target_id IN (SELECT id FROM work_packages WHERE task_id = ?)))
+                    OR (target_type = 'mimo_session' AND target_id IN (SELECT id FROM mimo_sessions WHERE task_id = ?))
+                    OR (target_type = 'role_delegation' AND target_id IN (SELECT id FROM role_delegations WHERE task_id = ?))
+                    ORDER BY id""",
+                (tid, tid, tid, tid, tid, tid, tid),
             )
         return [{**dict(row), "payload": _loads(str(row["payload_json"]))} for row in rows]
 
@@ -3828,8 +3881,23 @@ class OrchestratorService:
                     raise OrchestratorError("GLM and Test Owner roles require project authorization for status snapshots")
         if pid is not None:
             projects_rows = self.store.fetchall("SELECT * FROM projects WHERE id = ? ORDER BY id", (pid,))
+            recent_audits = self.store.fetchall(
+                """SELECT * FROM audit_log WHERE
+                    (target_type = 'project' AND target_id = ?)
+                    OR (target_type = 'agent' AND target_id IN (SELECT id FROM agents WHERE project_id = ?))
+                    OR (target_type = 'task' AND target_id IN (SELECT id FROM tasks WHERE project_id = ?))
+                    OR (target_type = 'work_package' AND target_id IN (SELECT id FROM work_packages WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)))
+                    OR (target_type = 'submission' AND target_id IN (SELECT id FROM submissions WHERE work_package_id IN (SELECT id FROM work_packages WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?))))
+                    OR (target_type = 'review' AND target_id IN (SELECT id FROM reviews WHERE (target_type = 'task' AND target_id IN (SELECT id FROM tasks WHERE project_id = ?)) OR (target_type = 'work_package' AND target_id IN (SELECT id FROM work_packages WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)))))
+                    OR (target_type = 'mimo_session' AND target_id IN (SELECT id FROM mimo_sessions WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)))
+                    OR (target_type = 'grace_artifact' AND target_id IN (SELECT id FROM grace_artifacts WHERE project_id = ?))
+                    OR (target_type = 'role_delegation' AND target_id IN (SELECT id FROM role_delegations WHERE project_id = ?))
+                    ORDER BY id DESC LIMIT 10""",
+                (pid, pid, pid, pid, pid, pid, pid, pid, pid, pid),
+            )
         else:
             projects_rows = self.store.fetchall("SELECT * FROM projects ORDER BY id")
+            recent_audits = self.store.fetchall("SELECT * FROM audit_log ORDER BY id DESC LIMIT 10")
 
         projects_out = []
         for p_row in projects_rows:
@@ -3853,7 +3921,6 @@ class OrchestratorService:
             p_dict["tasks"] = tasks_out
             projects_out.append(p_dict)
 
-        recent_audits = self.store.fetchall("SELECT * FROM audit_log ORDER BY id DESC LIMIT 10")
         return {
             "snapshot_timestamp": _now(),
             "projects_count": len(projects_out),
@@ -3866,7 +3933,23 @@ class OrchestratorService:
         act, tid = self._resolve_read_args(actor_or_id, task_id, actor)
         if tid is None:
             raise OrchestratorError("task_id is required")
-        task = self.get_task(tid, actor=act)
+
+        task = self._task(tid)
+        proj_id = int(task["project_id"])
+
+        if act is not None:
+            if act.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+                assigned = self.store.fetchone(
+                    """SELECT COUNT(*) FROM work_packages
+                       WHERE task_id = ? AND (assigned_junior_agent = ? OR assigned_pro_agent = ? OR claimed_by_agent = ?)""",
+                    (tid, act.name, act.name, act.name),
+                )
+                if assigned is None or assigned[0] == 0:
+                    raise OrchestratorError(f"Worker {act.name} is not authorized to read task {tid}")
+            elif act.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+                if not self._is_authorized_for_project(act, proj_id, task_id=tid):
+                    raise OrchestratorError(f"Actor {act.name!r} is not authorized for task {tid}")
+
         pkgs_rows = self.store.fetchall("SELECT id, title, status FROM work_packages WHERE task_id = ? ORDER BY id", (tid,))
 
         active_ids = []
@@ -3993,7 +4076,7 @@ class OrchestratorService:
                 if not self._is_authorized_for_project(act, int(task["project_id"]), task_id=tid):
                     raise OrchestratorError(f"Actor {act.name!r} is not authorized for task {tid} audit log")
         clamped_limit = max(1, min(limit, 200))
-        if task_id is None:
+        if tid is None:
             rows = self.store.fetchall(
                 "SELECT * FROM audit_log WHERE id > ? ORDER BY id ASC LIMIT ?",
                 (after_audit_id, clamped_limit + 1),
@@ -4002,12 +4085,13 @@ class OrchestratorService:
             rows = self.store.fetchall(
                 """SELECT * FROM audit_log WHERE id > ? AND (
                      (target_type = 'task' AND target_id = ?)
-                     OR target_id IN (SELECT id FROM work_packages WHERE task_id = ?)
-                     OR target_id IN (SELECT id FROM submissions WHERE work_package_id IN (SELECT id FROM work_packages WHERE task_id = ?))
-                     OR target_id IN (SELECT id FROM reviews WHERE target_type = 'task' AND target_id = ?)
-                     OR target_id IN (SELECT id FROM mimo_sessions WHERE task_id = ?)
+                     OR (target_type = 'work_package' AND target_id IN (SELECT id FROM work_packages WHERE task_id = ?))
+                     OR (target_type = 'submission' AND target_id IN (SELECT id FROM submissions WHERE work_package_id IN (SELECT id FROM work_packages WHERE task_id = ?)))
+                     OR (target_type = 'review' AND target_id IN (SELECT id FROM reviews WHERE (target_type = 'task' AND target_id = ?) OR target_id IN (SELECT id FROM work_packages WHERE task_id = ?)))
+                     OR (target_type = 'mimo_session' AND target_id IN (SELECT id FROM mimo_sessions WHERE task_id = ?))
+                     OR (target_type = 'role_delegation' AND target_id IN (SELECT id FROM role_delegations WHERE task_id = ?))
                    ) ORDER BY id ASC LIMIT ?""",
-                (after_audit_id, task_id, task_id, task_id, task_id, task_id, clamped_limit + 1),
+                (after_audit_id, tid, tid, tid, tid, tid, tid, tid, clamped_limit + 1),
             )
 
         has_more = len(rows) > clamped_limit
@@ -4220,7 +4304,8 @@ class OrchestratorService:
             ):
                 raise OrchestratorError(f"Worker {actor.name} is not authorized to read submission {submission_id}")
         elif actor.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
-            self._authorize(actor, OrchestratorRole.GLM, task["project_id"], task["id"])
+            if not self._is_authorized_for_project(actor, int(task["project_id"]), task_id=int(task["id"])):
+                raise OrchestratorError(f"Actor {actor.name!r} is not authorized for submission {submission_id}")
         return sub
 
     def get_review(self, actor: ActorIdentity, review_id: int) -> dict[str, Any]:
@@ -4240,7 +4325,8 @@ class OrchestratorService:
             raise OrchestratorError(f"Unknown review target_type: {rev['target_type']}")
         task = self._task(task_id)
         if actor.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
-            self._authorize(actor, OrchestratorRole.GLM, task["project_id"], task["id"])
+            if not self._is_authorized_for_project(actor, int(task["project_id"]), task_id=task_id):
+                raise OrchestratorError(f"Actor {actor.name!r} is not authorized for review {review_id}")
         return rev
 
     def get_latest_grace_artifact(self, actor: ActorIdentity, project_id: int, artifact_type: str) -> str:
@@ -4248,7 +4334,8 @@ class OrchestratorService:
         if actor.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
             raise OrchestratorError(f"Worker role {actor.primary_role.value} is not authorized to read GRACE artifacts")
         if actor.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
-            self._authorize(actor, OrchestratorRole.GLM, project_id)
+            if not self._is_authorized_for_project(actor, project_id):
+                raise OrchestratorError(f"Actor {actor.name!r} is not authorized for project {project_id} artifacts")
         row = self.store.fetchone(
             """SELECT content FROM grace_artifacts WHERE project_id = ? AND artifact_type = ?
                ORDER BY revision DESC LIMIT 1""",

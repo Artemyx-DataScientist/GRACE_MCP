@@ -19,16 +19,48 @@ def test_db_schema_v4_migration(tmp_path: Path) -> None:
     db_path = tmp_path / "legacy.sqlite3"
     with sqlite3.connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        conn.execute("DROP TABLE agents")
+        conn.execute(
+            """CREATE TABLE agents (
+                 id INTEGER PRIMARY KEY,
+                 project_id INTEGER NOT NULL REFERENCES projects(id),
+                 name TEXT NOT NULL,
+                 primary_role TEXT NOT NULL,
+                 capabilities_json TEXT NOT NULL,
+                 mimo_model TEXT,
+                 mimo_agent TEXT,
+                 availability TEXT NOT NULL CHECK(availability IN ('available', 'unavailable')),
+                 updated_at TEXT NOT NULL,
+                 UNIQUE(project_id, name)
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO projects (
+                 id, name, repo_path, grace_path, main_branch,
+                 allowed_test_commands_json, created_at, updated_at
+               ) VALUES (1, 'legacy', 'repo', 'grace', 'main', '{}', 'before', 'before')"""
+        )
+        conn.execute(
+            """INSERT INTO agents (
+                 id, project_id, name, primary_role, capabilities_json,
+                 mimo_model, mimo_agent, availability, updated_at
+               ) VALUES (1, 1, 'legacy-glm', 'glm', '["glm"]', NULL, NULL, 'available', 'before')"""
+        )
         conn.execute("PRAGMA user_version = 3")
         conn.commit()
 
-    _ = OrchestratorService(db_path)
+    service = OrchestratorService(db_path)
+    service.close()
     with sqlite3.connect(db_path) as conn:
         ver = conn.execute("PRAGMA user_version").fetchone()[0]
         assert ver == 4
         cursor = conn.execute("PRAGMA table_info(agents)")
         cols = {row[1] for row in cursor.fetchall()}
         assert {"runtime", "provider", "model", "reasoning_profile"}.issubset(cols)
+        migrated = conn.execute(
+            "SELECT name, primary_role, runtime, provider, model, reasoning_profile FROM agents WHERE id = 1"
+        ).fetchone()
+        assert migrated == ("legacy-glm", "glm", None, None, None, None)
 
 
 def test_agent_registration_persists_metadata(tmp_path: Path) -> None:

@@ -306,11 +306,11 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
 
     @tool_decorator("task.get", description="Read task, work packages, GRACE revisions, and reviews.")
     def get_task(task_id: int) -> dict[str, Any]:
-        return _plain(service.get_task(task_id))
+        return _plain(service.get_task(actor, task_id))
 
     @tool_decorator("task.get_next_action", description="Project the next valid gate without changing state.")
     def get_next_action(task_id: int) -> dict[str, Any]:
-        task = service.get_task(task_id)
+        task = service.get_task(actor, task_id)
         next_step = project_next_action(task["status"], task.get("work_packages"))
         blocked_reason = None
         if next_step["role"] not in {"none", "glm_or_codex", actor.primary_role.value}:
@@ -608,7 +608,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
 
     @tool_decorator("mimo.get_session", description="Read immutable launch evidence and current recorded state for one Mimo session.")
     def get_mimo_session(session_id: int) -> dict[str, Any]:
-        return _plain(service.get_mimo_session(session_id))
+        return _plain(service.get_mimo_session(actor, session_id))
 
     @tool_decorator("mimo.poll_session", description="Record an observed exit code for a service-owned headless Mimo process.")
     def poll_mimo_session(session_id: int) -> dict[str, Any]:
@@ -651,9 +651,9 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
         risk_notes: str,
         worker_report: dict[str, Any],
     ) -> dict[str, Any]:
-        package = service.get_work_package(work_package_id)
-        task = service.get_task(package["task_id"])
-        project = service.get_project(task["project_id"])
+        package = service.get_work_package(actor, work_package_id)
+        task = service.get_task(actor, package["task_id"])
+        project = service.get_project(actor, task["project_id"])
         evidence = RepositoryBoundary(Path(project["repo_path"])).derive_submission(package["base_commit"], head_commit)
         return _plain(service.submit_package(actor, work_package_id, summary, evidence, tests_run, risk_notes, worker_report))
 
@@ -666,9 +666,9 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
         risk_notes: str,
         controller_report: dict[str, Any],
     ) -> dict[str, Any]:
-        package = service.get_work_package(work_package_id)
-        task = service.get_task(package["task_id"])
-        project = service.get_project(task["project_id"])
+        package = service.get_work_package(actor, work_package_id)
+        task = service.get_task(actor, package["task_id"])
+        project = service.get_project(actor, task["project_id"])
         evidence = RepositoryBoundary(Path(project["repo_path"])).derive_submission(package["base_commit"], head_commit)
         return _plain(
             service.submit_controller_repair(

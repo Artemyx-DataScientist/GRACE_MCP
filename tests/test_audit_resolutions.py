@@ -9,9 +9,7 @@ import sys
 import pytest
 
 from grace_orchestrator.db import OrchestratorStore
-from grace_orchestrator.host_continuation import HostContinuationSupervisor, HostContinuationConfig
-from grace_orchestrator.models import ActorIdentity, MimoSessionStatus, OrchestratorError, OrchestratorRole
-from grace_orchestrator.process_identity import ProcessIdentity, ProcessMatchState
+from grace_orchestrator.models import ActorIdentity, OrchestratorError, OrchestratorRole
 from grace_orchestrator.service import OrchestratorService
 
 
@@ -115,10 +113,10 @@ def test_db_migration_v3_populated_database(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
 
-    # Opening via OrchestratorStore triggers migration v3
+    # Opening via OrchestratorStore triggers migration v4
     store = OrchestratorStore(db_file)
     ver = store.fetchone("PRAGMA user_version")[0]
-    assert ver == 3
+    assert ver == 4
 
     rows = store.fetchall("SELECT * FROM mimo_sessions")
     assert len(rows) == 1

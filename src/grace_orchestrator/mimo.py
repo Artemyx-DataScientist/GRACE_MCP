@@ -31,6 +31,7 @@ import subprocess
 from typing import Any, Mapping
 
 from .models import ExecutionRuntime, MimoLaunchMode, OrchestratorError, OrchestratorRole
+from .process_identity import capture_process_identity
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +55,6 @@ def is_external_antigravity_runtime(runtime: str | None | ExecutionRuntime) -> b
         return runtime == ExecutionRuntime.ANTIGRAVITY
     return canonical_runtime(runtime) == ExecutionRuntime.ANTIGRAVITY
 
-
-from .process_identity import capture_process_identity
 
 
 @dataclass(frozen=True, slots=True)

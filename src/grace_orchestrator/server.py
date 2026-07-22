@@ -48,6 +48,8 @@ from .service import OrchestratorService
 
 ALL_REQUIRED_TOOLS = frozenset({
     "orchestrator.whoami",
+    "inbox.next",
+    "inbox.list",
     "project.init",
     "project.set_test_commands",
     "agent.register",
@@ -118,16 +120,13 @@ ADMINISTRATIVE_TOOLS = frozenset({
 
 WORKER_TOOLS = frozenset({
     "orchestrator.whoami",
+    "inbox.next",
+    "inbox.list",
     "workpackage.claim",
     "workpackage.get_summary",
     "task.get_summary",
     "submission.create",
-    "handoff.list_events_page",
     "handoff.report_worker_event",
-    "audit.list",
-    "audit.list_page",
-    "repo.status",
-    "repo.diff",
     "repo.run_tests",
     "gate.validate_worker_report",
 })
@@ -261,6 +260,10 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
                 availability,
                 mimo_model,
                 mimo_agent,
+                runtime=runtime,
+                provider=provider,
+                model=model,
+                reasoning_profile=reasoning_profile,
             )
         )
 
@@ -722,15 +725,21 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     ) -> dict[str, Any]:
         return _plain(service.final_review(actor, task_id, decision, findings, required_fixes))
 
+    @tool_decorator("inbox.next", description="Retrieve the single highest-priority inbox item for the bound actor identity.")
+    def inbox_next(project_id: int | None = None) -> dict[str, Any]:
+        return _plain(service.inbox_next(actor, project_id=project_id))
+
+    @tool_decorator("inbox.list", description="Retrieve actor-bound inbox envelopes in deterministic priority order.")
+    def inbox_list(project_id: int | None = None, limit: int = 20) -> dict[str, Any]:
+        return _plain(service.inbox_list(actor, project_id=project_id, limit=limit))
+
     @tool_decorator("repo.status", description="Read project-local Git status without mutation.")
-    def repo_status(project_id: int) -> dict[str, Any]:
-        project = service.get_project(project_id)
-        return _plain(RepositoryBoundary(Path(project["repo_path"])).status())
+    def repo_status(project_id: int, work_package_id: int | None = None) -> dict[str, Any]:
+        return _plain(service.repo_status(actor, project_id, work_package_id=work_package_id))
 
     @tool_decorator("repo.diff", description="Read a project-local Git diff for a fixed scope.")
-    def repo_diff(project_id: int, scope: str = "all", file_list: list[str] | None = None) -> dict[str, str]:
-        project = service.get_project(project_id)
-        return {"diff": RepositoryBoundary(Path(project["repo_path"])).diff(scope, file_list)}
+    def repo_diff(project_id: int, work_package_id: int | None = None, scope: str = "all", file_list: list[str] | None = None) -> dict[str, str]:
+        return _plain(service.repo_diff(actor, project_id, work_package_id=work_package_id, scope=scope, file_list=file_list))
 
     @tool_decorator("repo.run_tests", description="Run a registered allowlisted test command by key.")
     def repo_run_tests(
@@ -749,25 +758,25 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
             }
         )
 
-    @mcp.tool("task.get_summary", description="Retrieve a compact, structured summary of a task, its package counts, and recommended next_action.")
+    @tool_decorator("task.get_summary", description="Retrieve a compact, structured summary of a task, its package counts, and recommended next_action.")
     def get_task_summary(task_id: int) -> dict[str, Any]:
-        return _plain(service.get_task_summary(task_id))
+        return _plain(service.get_task_summary(actor, task_id))
 
-    @mcp.tool("workpackage.get_summary", description="Retrieve a compact summary of a work package.")
+    @tool_decorator("workpackage.get_summary", description="Retrieve a compact summary of a work package.")
     def get_work_package_summary(work_package_id: int) -> dict[str, Any]:
-        return _plain(service.get_work_package_summary(work_package_id))
+        return _plain(service.get_work_package_summary(actor, work_package_id))
 
-    @mcp.tool("handoff.list_events_page", description="Paginated event retrieval for work package handoffs.")
-    def list_handoff_events_page(work_package_id: int, after_event_id: int = 0, limit: int = 20) -> dict[str, Any]:
-        return _plain(service.list_handoff_events_page(work_package_id, after_event_id=after_event_id, limit=limit))
+    @tool_decorator("handoff.list_events_page", description="Paginated event retrieval for work package handoffs.")
+    def list_handoff_events_page(work_package_id: int, after_event_id: str | None = None, limit: int = 20) -> dict[str, Any]:
+        return _plain(service.list_handoff_events_page(actor, work_package_id, after_event_id=after_event_id, limit=limit))
 
-    @mcp.tool("audit.list", description="List all audit events for a task or globally.")
+    @tool_decorator("audit.list", description="List all audit events for a task or globally.")
     def list_audit(task_id: int | None = None) -> list[dict[str, Any]]:
-        return _plain(service.list_audit(task_id=task_id))
+        return _plain(service.list_audit(actor, task_id=task_id))
 
-    @mcp.tool("audit.list_page", description="Paginated audit event retrieval.")
+    @tool_decorator("audit.list_page", description="Paginated audit event retrieval.")
     def list_audit_page(task_id: int | None = None, after_audit_id: int = 0, limit: int = 20) -> dict[str, Any]:
-        return _plain(service.list_audit_page(task_id=task_id, after_audit_id=after_audit_id, limit=limit))
+        return _plain(service.list_audit_page(actor, task_id=task_id, after_audit_id=after_audit_id, limit=limit))
 
     def artifact_resource_for(artifact_type: str):
         def artifact_resource(project_id: int) -> str:
@@ -779,20 +788,20 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
     if role in {OrchestratorRole.USER, OrchestratorRole.CODEX, OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
         @mcp.resource("orchestrator://project/{project_id}", mime_type="application/json")
         def project_resource(project_id: int) -> str:
-            return json.dumps(service.get_project(project_id), default=str)
+            return json.dumps(service.get_project(actor, project_id), default=str)
 
         @mcp.resource("orchestrator://project/{project_id}/active", mime_type="application/json")
         def project_active_resource(project_id: int) -> str:
-            snapshot = service.get_orchestrator_status_snapshot(project_id=project_id)
+            snapshot = service.get_orchestrator_status_snapshot(actor, project_id=project_id)
             return json.dumps(snapshot, default=str)
 
         @mcp.resource("orchestrator://task/{task_id}", mime_type="application/json")
         def task_resource(task_id: int) -> str:
-            return json.dumps(service.get_task(task_id), default=str)
+            return json.dumps(service.get_task(actor, task_id), default=str)
 
         @mcp.resource("orchestrator://workpackage/{work_package_id}", mime_type="application/json")
         def work_package_resource(work_package_id: int) -> str:
-            return json.dumps(service.get_work_package(work_package_id), default=str)
+            return json.dumps(service.get_work_package(actor, work_package_id), default=str)
 
         @mcp.resource("orchestrator://review/{review_id}", mime_type="application/json")
         def review_resource(review_id: int) -> str:
@@ -800,7 +809,7 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
 
         @mcp.resource("orchestrator://mimo-session/{session_id}", mime_type="application/json")
         def mimo_session_resource(session_id: int) -> str:
-            return json.dumps(service.get_mimo_session(session_id), default=str)
+            return json.dumps(service.get_mimo_session(actor, session_id), default=str)
 
         for filename, artifact_type in GRACE_ARTIFACT_TYPES.items():
             uri = f"grace://project/{{project_id}}/{filename}"
@@ -808,11 +817,11 @@ def create_server(actor: ActorIdentity, data_dir: Path) -> FastMCP:
 
     @mcp.resource("orchestrator://task/{task_id}/summary", mime_type="application/json")
     def task_summary_resource(task_id: int) -> str:
-        return json.dumps(service.get_task_summary(task_id), default=str)
+        return json.dumps(service.get_task_summary(actor, task_id), default=str)
 
     @mcp.resource("orchestrator://workpackage/{work_package_id}/summary", mime_type="application/json")
     def work_package_summary_resource(work_package_id: int) -> str:
-        return json.dumps(service.get_work_package_summary(work_package_id), default=str)
+        return json.dumps(service.get_work_package_summary(actor, work_package_id), default=str)
 
     @mcp.resource("orchestrator://submission/{submission_id}", mime_type="application/json")
     def submission_resource(submission_id: int) -> str:

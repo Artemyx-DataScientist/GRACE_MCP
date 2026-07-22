@@ -49,6 +49,10 @@ CREATE TABLE IF NOT EXISTS agents (
   capabilities_json TEXT NOT NULL,
   mimo_model TEXT,
   mimo_agent TEXT,
+  runtime TEXT,
+  provider TEXT,
+  model TEXT,
+  reasoning_profile TEXT,
   availability TEXT NOT NULL CHECK(availability IN ('available', 'unavailable')),
   updated_at TEXT NOT NULL,
   UNIQUE(project_id, name)
@@ -302,6 +306,10 @@ class OrchestratorStore:
             self.connection.executescript(SCHEMA)
             self._ensure_column("agents", "mimo_model", "TEXT")
             self._ensure_column("agents", "mimo_agent", "TEXT")
+            self._ensure_column("agents", "runtime", "TEXT")
+            self._ensure_column("agents", "provider", "TEXT")
+            self._ensure_column("agents", "model", "TEXT")
+            self._ensure_column("agents", "reasoning_profile", "TEXT")
             self._ensure_column(
                 "work_packages",
                 "worker_pro_available",
@@ -386,6 +394,9 @@ class OrchestratorStore:
                     self.connection.execute("ALTER TABLE mimo_sessions_v3 RENAME TO mimo_sessions;")
                 self.connection.execute("PRAGMA user_version = 3;")
                 self.connection.execute("PRAGMA foreign_keys = ON;")
+
+            if user_ver < 4:
+                self.connection.execute("PRAGMA user_version = 4;")
 
             self.connection.execute("PRAGMA journal_mode = WAL")
 

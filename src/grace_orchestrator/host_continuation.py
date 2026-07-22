@@ -27,6 +27,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
+import logging
 import os
 from pathlib import Path
 import shlex
@@ -40,6 +41,8 @@ import uuid
 from .models import stable_hash
 from .db import OrchestratorStore
 from .process_identity import ProcessIdentity, ProcessMatchState, capture_process_identity, verify_process_liveness
+
+logger = logging.getLogger(__name__)
 
 
 TRIGGER_EVENT_TYPES = frozenset(

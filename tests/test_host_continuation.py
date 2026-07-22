@@ -252,3 +252,20 @@ def test_host_builds_controller_prompt_from_durable_run_data(tmp_path: Path, mon
     assert "M-ORCH-LEDGER" in prompt
     assert "ACCEPTED / REWORK_REQUIRED / BLOCKED_WAITING_USER" in prompt
     assert "review.glm_submit" in prompt
+
+
+def test_host_continuation_skips_malformed_ndjson_line(tmp_path: Path) -> None:
+    service, _project, _task, package, junior, _glm = _ready_package(tmp_path)
+    submission = _submit(service, junior, package["id"])
+    run_root = Path(submission["handoff_event"]["run_root"])
+    events_file = run_root / "events.ndjson"
+
+    content = "CORRUPT JSON LINE {{{\n" + events_file.read_text(encoding="utf-8")
+    events_file.write_text(content, encoding="utf-8")
+
+    supervisor = HostContinuationSupervisor(HostContinuationConfig(data_dir=tmp_path))
+    parsed_events = supervisor._read_events(events_file, after_index=0)
+
+    assert len(parsed_events) >= 2
+    types = [evt[1]["type"] for evt in parsed_events]
+    assert "INVALID_EVENT_JSON" in types

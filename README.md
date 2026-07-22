@@ -41,6 +41,15 @@ Logs use stderr; stdout is reserved for MCP JSON-RPC.
 Keep `GRACE_ORCHESTRATOR_DATA_DIR` outside the repository: Mimo dispatches
 create isolated Git worktrees below that directory.
 
+## GUI-Neutral Inbox & Project Authorization
+
+`inbox.next` and `inbox.list` provide passive, backend-neutral inbox queries returning actor-bound execution items:
+- Queries are strictly bounded by process identity (`GRACE_ORCHESTRATOR_ACTOR_NAME` / `GRACE_ORCHESTRATOR_ACTOR_ROLE`).
+- Inbox items contain only actions that the caller has active role or project capability/delegation authorization to perform.
+- For GUI-backed environments (e.g. Antigravity IDE, VSCode, Codex GUI), active tab or context switching is performed manually by the human user.
+- Calling `inbox.next` or `inbox.list` eliminates context transfer overhead, but does NOT launch, spawn, or wake up background Codex/ZCode/Antigravity instances.
+- Project-scoped authorization is strictly enforced across both tool calls and FastMCP `@mcp.resource` endpoints. `GLM` and `TEST_OWNER` primary roles require explicit project capability registration or delegation to access project resources.
+
 ## Mimo setup
 
 1. Register every non-Codex agent with its role capabilities and its exact

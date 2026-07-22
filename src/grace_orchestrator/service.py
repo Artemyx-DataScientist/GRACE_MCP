@@ -38,7 +38,7 @@ import uuid
 
 from .db import OrchestratorStore
 from .hooks import HookContext, HookEvent, HookRegistry, install_default_hooks
-from .process_identity import ProcessIdentity, ProcessMatchState, capture_process_identity, verify_process_liveness
+from .process_identity import ProcessIdentity, ProcessMatchState, verify_process_liveness
 from .mimo import (
 
     MimoRunner,
@@ -341,6 +341,45 @@ class OrchestratorService:
         task_id: int | None = None,
     ) -> OrchestratorRole:
         return authorize_role(actor, required_role, self._delegations(project_id, task_id))
+
+    def _is_authorized_for_project(
+        self,
+        actor: ActorIdentity,
+        project_id: int,
+        required_role: OrchestratorRole | None = None,
+        task_id: int | None = None,
+    ) -> bool:
+        if actor.primary_role in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
+            return True
+        role_to_check = required_role or actor.primary_role
+
+        # Check explicit active delegation
+        delegations = self._delegations(project_id, task_id)
+        for delegation in delegations:
+            if delegation.get("substitute_actor") == actor.name:
+                if delegation.get("delegated_role") == role_to_check.value and delegation.get("revoked_at") is None:
+                    return True
+
+        # Check registered agent capability in project
+        try:
+            agent = self.get_agent(project_id, actor.name)
+            if agent and agent.get("availability") == "available":
+                capabilities = set(agent.get("capabilities") or [])
+                if role_to_check.value in capabilities or agent.get("primary_role") == role_to_check.value:
+                    return True
+        except OrchestratorError:
+            pass
+
+        return False
+
+    def _is_delegated_codex(self, actor: ActorIdentity, project_id: int | None) -> bool:
+        if project_id is None:
+            return False
+        try:
+            self._authorize(actor, OrchestratorRole.CODEX, project_id)
+            return True
+        except OrchestratorError:
+            return False
 
     def _authorize_assigned_worker(
         self,
@@ -670,6 +709,10 @@ class OrchestratorService:
         availability: str = "available",
         mimo_model: str | None = None,
         mimo_agent: str | None = None,
+        runtime: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        reasoning_profile: str | None = None,
     ) -> dict[str, Any]:
         # START_CONTRACT: OrchestratorService.register_agent
         #   PURPOSE: Register a model's availability and eligible role capabilities.
@@ -696,13 +739,17 @@ class OrchestratorService:
         timestamp = _now()
         with self.store.transaction() as conn:
             conn.execute(
-                """INSERT INTO agents (project_id, name, primary_role, capabilities_json, mimo_model, mimo_agent, availability, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO agents (project_id, name, primary_role, capabilities_json, mimo_model, mimo_agent, runtime, provider, model, reasoning_profile, availability, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(project_id, name) DO UPDATE SET
                      primary_role = excluded.primary_role,
                      capabilities_json = excluded.capabilities_json,
                      mimo_model = excluded.mimo_model,
                      mimo_agent = excluded.mimo_agent,
+                     runtime = excluded.runtime,
+                     provider = excluded.provider,
+                     model = excluded.model,
+                     reasoning_profile = excluded.reasoning_profile,
                      availability = excluded.availability,
                      updated_at = excluded.updated_at""",
                 (
@@ -712,6 +759,10 @@ class OrchestratorService:
                     _json(capability_values),
                     normalized_model,
                     normalized_mimo_agent,
+                    runtime.strip() if runtime else None,
+                    provider.strip() if provider else None,
+                    model.strip() if model else None,
+                    reasoning_profile.strip() if reasoning_profile else None,
                     availability,
                     timestamp,
                 ),
@@ -730,6 +781,10 @@ class OrchestratorService:
                     "capabilities": capability_values,
                     "mimo_model": normalized_model,
                     "mimo_agent": normalized_mimo_agent,
+                    "runtime": runtime,
+                    "provider": provider,
+                    "model": model,
+                    "reasoning_profile": reasoning_profile,
                 },
             )
         return self.get_agent(project_id, name)
@@ -1852,18 +1907,19 @@ class OrchestratorService:
 
         # Step 2: Cancel headless RUNNING processes outside DB transaction
         for sess in active_sessions:
-            if sess["lifecycle_state"] == MimoSessionStatus.RUNNING.value and sess["mode"] == MimoLaunchMode.HEADLESS.value:
+            session = dict(sess)
+            if session["lifecycle_state"] == MimoSessionStatus.RUNNING.value and session["mode"] == MimoLaunchMode.HEADLESS.value:
                 try:
-                    self.mimo_runner.cancel(int(sess["id"]))
+                    self.mimo_runner.cancel(int(session["id"]))
                 except Exception:
-                    pid = sess.get("pid")
+                    pid = session.get("pid")
                     if pid and isinstance(pid, int) and pid > 0:
                         ident = ProcessIdentity(
                             pid=pid,
-                            process_started_at_os=str(sess.get("process_started_at_os") or "UNKNOWN"),
-                            executable_path=str(sess.get("executable_path") or ""),
-                            argv_hash=str(sess.get("argv_hash") or ""),
-                            launch_nonce=str(sess.get("launch_nonce") or ""),
+                            process_started_at_os=str(session.get("process_started_at_os") or "UNKNOWN"),
+                            executable_path=str(session.get("executable_path") or ""),
+                            argv_hash=str(session.get("argv_hash") or ""),
+                            launch_nonce=str(session.get("launch_nonce") or ""),
                         )
                         match_state = verify_process_liveness(ident)
                         if match_state == ProcessMatchState.MATCH:
@@ -2512,10 +2568,37 @@ class OrchestratorService:
         task = self._task(task_id)
         if task["project_id"] != project_id:
             raise OrchestratorError("Task does not belong to project")
-        effective = self._authorize(actor, OrchestratorRole.GLM, project_id, task_id)
         project = self._project(project_id)
+        target_dir = Path(project["repo_path"])
+
+        if actor.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+            if work_package_id is None:
+                raise OrchestratorError("Worker test execution requires a work_package_id")
+            pkg = self.get_work_package(actor, work_package_id)
+            effective = self._authorize_assigned_worker(
+                actor,
+                OrchestratorRole.WORKER_JUNIOR if pkg["status"] in {"ASSIGNED", "CLAIMED_JUNIOR"} else OrchestratorRole.WORKER_PRO,
+                task,
+                pkg,
+            )
+            latest_sess = self.store.fetchone(
+                "SELECT workspace_path FROM mimo_sessions WHERE work_package_id = ? AND lifecycle_state IN ('RUNNING', 'TUI_DETACHED', 'PREPARED') AND workspace_path IS NOT NULL ORDER BY id DESC LIMIT 1",
+                (work_package_id,),
+            )
+            if latest_sess and latest_sess["workspace_path"] and Path(str(latest_sess["workspace_path"])).is_dir():
+                target_dir = Path(str(latest_sess["workspace_path"]))
+        else:
+            effective = self._authorize(actor, OrchestratorRole.GLM, project_id, task_id)
+            if work_package_id is not None:
+                latest_sess = self.store.fetchone(
+                    "SELECT workspace_path FROM mimo_sessions WHERE work_package_id = ? AND lifecycle_state IN ('RUNNING', 'TUI_DETACHED', 'PREPARED') AND workspace_path IS NOT NULL ORDER BY id DESC LIMIT 1",
+                    (work_package_id,),
+                )
+                if latest_sess and latest_sess["workspace_path"] and Path(str(latest_sess["workspace_path"])).is_dir():
+                    target_dir = Path(str(latest_sess["workspace_path"]))
+
         allowed = _loads(project["allowed_test_commands_json"])
-        boundary = RepositoryBoundary(Path(project["repo_path"]), self.store.database_path.parent / "logs")
+        boundary = RepositoryBoundary(target_dir, self.store.database_path.parent / "logs")
         result = boundary.run_allowed_test(command_key, allowed)
         with self.store.transaction() as conn:
             cursor = conn.execute(
@@ -3010,17 +3093,6 @@ class OrchestratorService:
             )
         return self.get_mimo_session(session_id)
 
-    def get_project(self, project_id: int) -> dict[str, Any]:
-        project = self._project(project_id)
-        project["allowed_test_commands"] = _loads(project.pop("allowed_test_commands_json"))
-        return project
-
-    def get_mimo_session(self, session_id: int) -> dict[str, Any]:
-        session = self._mimo_session(session_id)
-        raw_command = session.pop("command_json")
-        session["command"] = _loads(raw_command) if raw_command else None
-        return session
-
     def list_handoff_events(self, actor: ActorIdentity, work_package_id: int) -> list[dict[str, Any]]:
         """Read the ordered handoff event stream for a package; this never changes workflow state."""
 
@@ -3213,42 +3285,502 @@ class OrchestratorService:
             self._audit(conn, actor, effective, "handoff.worker_reported", "work_package", work_package_id, event)
         return event
 
-    def get_work_package(self, package_id: int) -> dict[str, Any]:
-        package = self._package(package_id)
-        package["allowed_files"] = _loads(package.pop("allowed_files_json"))
-        package["forbidden_files"] = _loads(package.pop("forbidden_files_json"))
-        package["contract_discovery"] = _loads(package.pop("contract_discovery_json"))
-        package["test_surface"] = _loads(package.pop("test_surface_json"))
-        package["compact_report_format"] = _loads(package.pop("compact_report_format_json"))
-        package["session_routing"] = _loads(package.pop("session_routing_json"))
-        package["glm_scan_plan_report"] = _loads(package.pop("glm_scan_plan_report_json"))
-        package["operation_isolation"] = _loads(package.pop("operation_isolation_json"))
-        package["codex_required"] = bool(package["codex_required"])
-        package["worker_pro_available"] = bool(package["worker_pro_available"])
-        return package
+    def _format_package(self, package: dict[str, Any]) -> dict[str, Any]:
+        pkg = dict(package)
+        pkg["allowed_files"] = _loads(pkg.pop("allowed_files_json"))
+        pkg["forbidden_files"] = _loads(pkg.pop("forbidden_files_json"))
+        pkg["contract_discovery"] = _loads(pkg.pop("contract_discovery_json"))
+        pkg["test_surface"] = _loads(pkg.pop("test_surface_json"))
+        pkg["compact_report_format"] = _loads(pkg.pop("compact_report_format_json"))
+        pkg["session_routing"] = _loads(pkg.pop("session_routing_json"))
+        pkg["glm_scan_plan_report"] = _loads(pkg.pop("glm_scan_plan_report_json"))
+        pkg["operation_isolation"] = _loads(pkg.pop("operation_isolation_json"))
+        pkg["codex_required"] = bool(pkg["codex_required"])
+        pkg["worker_pro_available"] = bool(pkg["worker_pro_available"])
+        return pkg
 
-    def get_task(self, task_id: int) -> dict[str, Any]:
-        task = self._task(task_id)
+    def _build_compact_context(
+        self,
+        task: Mapping[str, Any],
+        pkg: Mapping[str, Any],
+        proj: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        discovery_raw = _loads(str(pkg.get("contract_discovery_json", "{}")))
+        compact_discovery = {
+            "module_refs": discovery_raw.get("module_refs", []),
+            "verification_refs": discovery_raw.get("verification_refs", []),
+            "rule_refs": discovery_raw.get("rule_refs", []),
+        }
+        return {
+            "task_title": task.get("title", ""),
+            "task_objective": task.get("objective", ""),
+            "architecture_intent": task.get("architecture_intent", ""),
+            "package_title": pkg.get("title", ""),
+            "package_objective": pkg.get("objective", ""),
+            "allowed_files": _loads(str(pkg.get("allowed_files_json", "[]"))),
+            "forbidden_files": _loads(str(pkg.get("forbidden_files_json", "[]"))),
+            "base_commit": pkg.get("base_commit", ""),
+            "contract_discovery": compact_discovery,
+            "test_surface": _loads(str(pkg.get("test_surface_json", "[]"))),
+            "commands_allowed": _loads(str(proj.get("allowed_test_commands_json", "{}"))),
+            "rollback_boundary": pkg.get("rollback_boundary", ""),
+            "stop_conditions": ["protected_test_touched", "forbidden_scope_touched", "identity_mismatch"],
+            "compact_report_requirements": _loads(str(pkg.get("compact_report_format_json", "[]"))),
+        }
+
+    def _clamp_envelope_size(self, env: dict[str, Any]) -> dict[str, Any]:
+        payload_bytes = json.dumps(env, default=str).encode("utf-8")
+        if len(payload_bytes) <= 4096:
+            return env
+        env_copy = dict(env)
+        context = dict(env_copy.get("context") or {})
+        if "contract_discovery" in context:
+            context["contract_discovery"] = "truncated_for_compact_envelope"
+        env_copy["context"] = context
+        return env_copy
+
+    def inbox_next(self, actor: ActorIdentity, project_id: int | None = None) -> dict[str, Any]:
+        """Return the single highest-priority inbox item for the bound actor identity."""
+        res = self.inbox_list(actor=actor, project_id=project_id, limit=1)
+        items = res.get("items") or []
+        if items:
+            return {"status": "item", "item": items[0]}
+        return {"status": "empty", "item": None}
+
+    def inbox_list(self, actor: ActorIdentity, project_id: int | None = None, limit: int = 20) -> dict[str, Any]:
+        """Return actor-bound inbox envelopes in deterministic priority order."""
+        clamped_limit = max(1, min(limit, 50))
+        candidates: list[tuple[int, str, str, dict[str, Any]]] = []
+
+        # Priority 1: Own claimed work
+        sql_claimed = "SELECT * FROM work_packages WHERE status IN ('CLAIMED_JUNIOR', 'CLAIMED_PRO') AND claimed_by_agent = ?"
+        params_claimed: list[Any] = [actor.name]
+        if project_id is not None:
+            sql_claimed += " AND task_id IN (SELECT id FROM tasks WHERE project_id = ?)"
+            params_claimed.append(project_id)
+        for pkg in [dict(r) for r in self.store.fetchall(sql_claimed, tuple(params_claimed))]:
+            task = self._task(int(pkg["task_id"]))
+            proj_id = int(task["project_id"])
+            proj = self._project(proj_id)
+            item_id = f"wp-{pkg['id']}-{pkg['status']}"
+            env = {
+                "item_id": item_id,
+                "kind": "work_package",
+                "project_id": proj_id,
+                "task_id": task["id"],
+                "work_package_id": pkg["id"],
+                "current_state": pkg["status"],
+                "assigned_actor": actor.name,
+                "assigned_role": actor.primary_role.value,
+                "title": pkg["title"],
+                "objective": pkg["objective"],
+                "next_action": {
+                    "tool": "submission.create",
+                    "arguments": {"work_package_id": pkg["id"]},
+                },
+                "context": self._build_compact_context(task, pkg, proj),
+                "updated_at": pkg["updated_at"],
+            }
+            candidates.append((1, pkg["updated_at"], f"wp-{pkg['id']}", self._clamp_envelope_size(env)))
+
+        # Priority 2: Assigned repair package
+        if actor.primary_role == OrchestratorRole.WORKER_PRO:
+            sql_repair = "SELECT * FROM work_packages WHERE status = 'REPAIR_REQUIRED' AND assigned_pro_agent = ?"
+            params_repair: list[Any] = [actor.name]
+            if project_id is not None:
+                sql_repair += " AND task_id IN (SELECT id FROM tasks WHERE project_id = ?)"
+                params_repair.append(project_id)
+            for pkg in [dict(r) for r in self.store.fetchall(sql_repair, tuple(params_repair))]:
+                task = self._task(int(pkg["task_id"]))
+                proj_id = int(task["project_id"])
+                proj = self._project(proj_id)
+                item_id = f"wp-{pkg['id']}-{pkg['status']}"
+                env = {
+                    "item_id": item_id,
+                    "kind": "work_package",
+                    "project_id": proj_id,
+                    "task_id": task["id"],
+                    "work_package_id": pkg["id"],
+                    "current_state": pkg["status"],
+                    "assigned_actor": actor.name,
+                    "assigned_role": actor.primary_role.value,
+                    "title": pkg["title"],
+                    "objective": pkg["objective"],
+                    "next_action": {
+                        "tool": "workpackage.claim",
+                        "arguments": {"work_package_id": pkg["id"]},
+                    },
+                    "context": self._build_compact_context(task, pkg, proj),
+                    "updated_at": pkg["updated_at"],
+                }
+                candidates.append((2, pkg["updated_at"], f"wp-{pkg['id']}", self._clamp_envelope_size(env)))
+
+        # Priority 3: Package awaiting GLM review
+        sql_rev = "SELECT * FROM work_packages WHERE status IN ('SUBMITTED', 'GLM_REVIEW_IN_PROGRESS')"
+        params_rev: list[Any] = []
+        if project_id is not None:
+            sql_rev += " AND task_id IN (SELECT id FROM tasks WHERE project_id = ?)"
+            params_rev.append(project_id)
+        for pkg in [dict(r) for r in self.store.fetchall(sql_rev, tuple(params_rev))]:
+            task = self._task(int(pkg["task_id"]))
+            proj_id = int(task["project_id"])
+            proj = self._project(proj_id)
+            if self._is_authorized_for_project(actor, proj_id, OrchestratorRole.GLM, task_id=task["id"]):
+                if actor.primary_role == OrchestratorRole.TEST_OWNER:
+                    try:
+                        agent = self.get_agent(proj_id, actor.name)
+                        caps = set(agent.get("capabilities") or [])
+                        if OrchestratorRole.GLM.value not in caps and not self._is_delegated_codex(actor, proj_id):
+                            continue
+                    except OrchestratorError:
+                        continue
+                item_id = f"rev-{pkg['id']}-{pkg['status']}"
+                env = {
+                    "item_id": item_id,
+                    "kind": "package_review",
+                    "project_id": proj_id,
+                    "task_id": task["id"],
+                    "work_package_id": pkg["id"],
+                    "current_state": pkg["status"],
+                    "assigned_actor": actor.name,
+                    "assigned_role": OrchestratorRole.GLM.value,
+                    "title": pkg["title"],
+                    "objective": pkg["objective"],
+                    "next_action": {
+                        "tool": "review.glm_submit",
+                        "arguments": {"work_package_id": pkg["id"]},
+                    },
+                    "context": {"task_title": task["title"], "package_title": pkg["title"]},
+                    "updated_at": pkg["updated_at"],
+                }
+                candidates.append((3, pkg["updated_at"], f"wp-{pkg['id']}", self._clamp_envelope_size(env)))
+
+        # Priority 4: Codex final review
+        if actor.primary_role == OrchestratorRole.CODEX or (actor.primary_role == OrchestratorRole.USER and self._is_delegated_codex(actor, project_id)):
+            sql_final = "SELECT * FROM tasks WHERE status IN ('GLM_ACCEPTED', 'CODEX_FINAL_REVIEW')"
+            params_final: list[Any] = []
+            if project_id is not None:
+                sql_final += " AND project_id = ?"
+                params_final.append(project_id)
+            for t in [dict(r) for r in self.store.fetchall(sql_final, tuple(params_final))]:
+                proj_id = int(t["project_id"])
+                if self._is_authorized_for_project(actor, proj_id, OrchestratorRole.CODEX, task_id=t["id"]):
+                    tool_name = "task.request_final_review" if t["status"] == "GLM_ACCEPTED" else "review.codex_submit"
+                    item_id = f"final-{t['id']}-{t['status']}"
+                    env = {
+                        "item_id": item_id,
+                        "kind": "final_review",
+                        "project_id": proj_id,
+                        "task_id": t["id"],
+                        "work_package_id": None,
+                        "current_state": t["status"],
+                        "assigned_actor": actor.name,
+                        "assigned_role": OrchestratorRole.CODEX.value,
+                        "title": t["title"],
+                        "objective": t["objective"],
+                        "next_action": {
+                            "tool": tool_name,
+                            "arguments": {"task_id": t["id"]},
+                        },
+                        "context": {"task_title": t["title"]},
+                        "updated_at": t["updated_at"],
+                    }
+                    candidates.append((4, t["updated_at"], f"task-{t['id']}", self._clamp_envelope_size(env)))
+
+        # Priority 5: New worker assignment
+        sql_assigned = "SELECT * FROM work_packages WHERE status = 'ASSIGNED' AND assigned_junior_agent = ?"
+        params_assigned: list[Any] = [actor.name]
+        if project_id is not None:
+            sql_assigned += " AND task_id IN (SELECT id FROM tasks WHERE project_id = ?)"
+            params_assigned.append(project_id)
+        for pkg in [dict(r) for r in self.store.fetchall(sql_assigned, tuple(params_assigned))]:
+            task = self._task(int(pkg["task_id"]))
+            proj_id = int(task["project_id"])
+            proj = self._project(proj_id)
+            item_id = f"wp-{pkg['id']}-{pkg['status']}"
+            env = {
+                "item_id": item_id,
+                "kind": "work_package",
+                "project_id": proj_id,
+                "task_id": task["id"],
+                "work_package_id": pkg["id"],
+                "current_state": pkg["status"],
+                "assigned_actor": actor.name,
+                "assigned_role": OrchestratorRole.WORKER_JUNIOR.value,
+                "title": pkg["title"],
+                "objective": pkg["objective"],
+                "next_action": {
+                    "tool": "workpackage.claim",
+                    "arguments": {"work_package_id": pkg["id"]},
+                },
+                "context": self._build_compact_context(task, pkg, proj),
+                "updated_at": pkg["updated_at"],
+            }
+            candidates.append((5, pkg["updated_at"], f"wp-{pkg['id']}", self._clamp_envelope_size(env)))
+
+        # Priority 6: Task planning & verification
+        sql_plan = "SELECT * FROM tasks WHERE status IN ('CODEX_TASK_CREATED', 'GLM_GRACE_PLANNED')"
+        params_plan: list[Any] = []
+        if project_id is not None:
+            sql_plan += " AND project_id = ?"
+            params_plan.append(project_id)
+        for t in [dict(r) for r in self.store.fetchall(sql_plan, tuple(params_plan))]:
+            proj_id = int(t["project_id"])
+            if self._is_authorized_for_project(actor, proj_id, OrchestratorRole.GLM, task_id=t["id"]):
+                tool_name = "task.plan" if t["status"] == "CODEX_TASK_CREATED" else "verification.register_plan"
+                item_id = f"gate-{t['id']}-{t['status']}"
+                env = {
+                    "item_id": item_id,
+                    "kind": "task_gate",
+                    "project_id": proj_id,
+                    "task_id": t["id"],
+                    "work_package_id": None,
+                    "current_state": t["status"],
+                    "assigned_actor": actor.name,
+                    "assigned_role": OrchestratorRole.GLM.value,
+                    "title": t["title"],
+                    "objective": t["objective"],
+                    "next_action": {
+                        "tool": tool_name,
+                        "arguments": {"task_id": t["id"]},
+                    },
+                    "context": {"task_title": t["title"], "objective": t["objective"]},
+                    "updated_at": t["updated_at"],
+                }
+                candidates.append((6, t["updated_at"], f"task-{t['id']}", self._clamp_envelope_size(env)))
+
+        sql_created_wp = "SELECT * FROM work_packages WHERE status = 'CREATED'"
+        params_created_wp: list[Any] = []
+        if project_id is not None:
+            sql_created_wp += " AND task_id IN (SELECT id FROM tasks WHERE project_id = ?)"
+            params_created_wp.append(project_id)
+        for pkg in [dict(r) for r in self.store.fetchall(sql_created_wp, tuple(params_created_wp))]:
+            task = self._task(int(pkg["task_id"]))
+            proj_id = int(task["project_id"])
+            if self._is_authorized_for_project(actor, proj_id, OrchestratorRole.GLM, task_id=task["id"]):
+                item_id = f"wp-{pkg['id']}-{pkg['status']}"
+                env = {
+                    "item_id": item_id,
+                    "kind": "task_gate",
+                    "project_id": proj_id,
+                    "task_id": task["id"],
+                    "work_package_id": pkg["id"],
+                    "current_state": pkg["status"],
+                    "assigned_actor": actor.name,
+                    "assigned_role": OrchestratorRole.GLM.value,
+                    "title": pkg["title"],
+                    "objective": pkg["objective"],
+                    "next_action": {
+                        "tool": "workpackage.assign",
+                        "arguments": {"work_package_id": pkg["id"]},
+                    },
+                    "context": {"task_title": task["title"], "package_title": pkg["title"]},
+                    "updated_at": pkg["updated_at"],
+                }
+                candidates.append((6, pkg["updated_at"], f"wp-{pkg['id']}", self._clamp_envelope_size(env)))
+
+        # Priority 7: Administrative intervention
+        if actor.primary_role in {OrchestratorRole.USER, OrchestratorRole.CODEX}:
+            sql_interv_t = "SELECT * FROM tasks WHERE status = 'HUMAN_INTERVENTION_REQUIRED'"
+            params_interv_t: list[Any] = []
+            if project_id is not None:
+                sql_interv_t += " AND project_id = ?"
+                params_interv_t.append(project_id)
+            for t in [dict(r) for r in self.store.fetchall(sql_interv_t, tuple(params_interv_t))]:
+                item_id = f"interv-t-{t['id']}"
+                env = {
+                    "item_id": item_id,
+                    "kind": "intervention",
+                    "project_id": int(t["project_id"]),
+                    "task_id": t["id"],
+                    "work_package_id": None,
+                    "current_state": t["status"],
+                    "assigned_actor": actor.name,
+                    "assigned_role": actor.primary_role.value,
+                    "title": t["title"],
+                    "objective": t["objective"],
+                    "next_action": {
+                        "tool": "task.get_summary",
+                        "arguments": {"task_id": t["id"]},
+                    },
+                    "context": {"task_title": t["title"], "intervention_required": True},
+                    "updated_at": t["updated_at"],
+                }
+                candidates.append((7, t["updated_at"], f"task-{t['id']}", self._clamp_envelope_size(env)))
+
+            sql_interv_wp = "SELECT * FROM work_packages WHERE status = 'HUMAN_INTERVENTION_REQUIRED'"
+            params_interv_wp: list[Any] = []
+            if project_id is not None:
+                sql_interv_wp += " AND task_id IN (SELECT id FROM tasks WHERE project_id = ?)"
+                params_interv_wp.append(project_id)
+            for pkg in [dict(r) for r in self.store.fetchall(sql_interv_wp, tuple(params_interv_wp))]:
+                task = self._task(int(pkg["task_id"]))
+                item_id = f"interv-wp-{pkg['id']}"
+                env = {
+                    "item_id": item_id,
+                    "kind": "intervention",
+                    "project_id": int(task["project_id"]),
+                    "task_id": task["id"],
+                    "work_package_id": pkg["id"],
+                    "current_state": pkg["status"],
+                    "assigned_actor": actor.name,
+                    "assigned_role": actor.primary_role.value,
+                    "title": pkg["title"],
+                    "objective": pkg["objective"],
+                    "next_action": {
+                        "tool": "workpackage.get_summary",
+                        "arguments": {"work_package_id": pkg["id"]},
+                    },
+                    "context": {"task_title": task["title"], "package_title": pkg["title"], "intervention_required": True},
+                    "updated_at": pkg["updated_at"],
+                }
+                candidates.append((7, pkg["updated_at"], f"wp-{pkg['id']}", self._clamp_envelope_size(env)))
+
+        candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+        sorted_envelopes = [c[3] for c in candidates[:clamped_limit]]
+        return {
+            "status": "ok",
+            "items": sorted_envelopes,
+            "count": len(sorted_envelopes),
+        }
+
+    def repo_status(self, actor: ActorIdentity, project_id: int, work_package_id: int | None = None) -> dict[str, Any]:
+        """Read Git status using the server-determined repo or workspace root."""
+        project = self.get_project(actor, project_id)
+        repo_root = Path(project["repo_path"])
+        if actor.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+            if work_package_id is None:
+                raise OrchestratorError("Worker repo operations require a work_package_id")
+            self.get_work_package(actor, work_package_id)
+            latest_sess = self.store.fetchone(
+                "SELECT workspace_path FROM mimo_sessions WHERE work_package_id = ? AND lifecycle_state IN ('RUNNING', 'TUI_DETACHED', 'PREPARED') AND workspace_path IS NOT NULL ORDER BY id DESC LIMIT 1",
+                (work_package_id,),
+            )
+            if latest_sess and latest_sess["workspace_path"] and Path(str(latest_sess["workspace_path"])).is_dir():
+                repo_root = Path(str(latest_sess["workspace_path"]))
+        elif actor.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+            if not self._is_authorized_for_project(actor, project_id):
+                raise OrchestratorError(f"Actor {actor.name!r} is not authorized for project {project_id}")
+        return RepositoryBoundary(repo_root).status()
+
+    def repo_diff(self, actor: ActorIdentity, project_id: int, work_package_id: int | None = None, scope: str = "all", file_list: list[str] | None = None) -> dict[str, str]:
+        """Read Git diff using the server-determined repo or workspace root."""
+        project = self.get_project(actor, project_id)
+        repo_root = Path(project["repo_path"])
+        if actor.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+            if work_package_id is None:
+                raise OrchestratorError("Worker repo operations require a work_package_id")
+            self.get_work_package(actor, work_package_id)
+            latest_sess = self.store.fetchone(
+                "SELECT workspace_path FROM mimo_sessions WHERE work_package_id = ? AND lifecycle_state IN ('RUNNING', 'TUI_DETACHED', 'PREPARED') AND workspace_path IS NOT NULL ORDER BY id DESC LIMIT 1",
+                (work_package_id,),
+            )
+            if latest_sess and latest_sess["workspace_path"] and Path(str(latest_sess["workspace_path"])).is_dir():
+                repo_root = Path(str(latest_sess["workspace_path"]))
+        elif actor.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+            if not self._is_authorized_for_project(actor, project_id):
+                raise OrchestratorError(f"Actor {actor.name!r} is not authorized for project {project_id}")
+        return {"diff": RepositoryBoundary(repo_root).diff(scope, file_list)}
+
+    def _resolve_read_args(
+        self,
+        first_arg: ActorIdentity | int | None,
+        second_arg: int | None = None,
+        actor_kw: ActorIdentity | None = None,
+    ) -> tuple[ActorIdentity | None, int | None]:
+        if isinstance(first_arg, ActorIdentity):
+            return first_arg, second_arg
+        if actor_kw is not None:
+            return actor_kw, int(first_arg) if first_arg is not None else None
+        return None, int(first_arg) if first_arg is not None else None
+
+    def get_project(self, actor_or_id: ActorIdentity | int, project_id: int | None = None, actor: ActorIdentity | None = None) -> dict[str, Any]:
+        act, pid = self._resolve_read_args(actor_or_id, project_id, actor)
+        if pid is None:
+            raise OrchestratorError("project_id is required")
+        if act is not None:
+            if act.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+                raise OrchestratorError(f"Worker role {act.primary_role.value} is not authorized to read project details")
+            if act.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+                if not self._is_authorized_for_project(act, pid):
+                    raise OrchestratorError(f"Actor {act.name!r} is not authorized for project {pid}")
+        project = self._project(pid)
+        project["allowed_test_commands"] = _loads(project.pop("allowed_test_commands_json"))
+        return project
+
+    def get_mimo_session(self, actor_or_id: ActorIdentity | int, session_id: int | None = None, actor: ActorIdentity | None = None) -> dict[str, Any]:
+        act, sid = self._resolve_read_args(actor_or_id, session_id, actor)
+        if sid is None:
+            raise OrchestratorError("session_id is required")
+        session = self._mimo_session(sid)
+        if act is not None:
+            if act.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+                if session.get("assigned_agent") != act.name and session.get("requested_by_agent") != act.name:
+                    raise OrchestratorError(f"Worker {act.name} is not authorized to read session {sid}")
+            elif act.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+                if not self._is_authorized_for_project(act, int(session["project_id"]), task_id=int(session["task_id"])):
+                    raise OrchestratorError(f"Actor {act.name!r} is not authorized for session {sid}")
+        raw_command = session.pop("command_json")
+        session["command"] = _loads(raw_command) if raw_command else None
+        return session
+
+    def get_work_package(self, actor_or_id: ActorIdentity | int, package_id: int | None = None, actor: ActorIdentity | None = None) -> dict[str, Any]:
+        act, wpid = self._resolve_read_args(actor_or_id, package_id, actor)
+        if wpid is None:
+            raise OrchestratorError("work_package_id is required")
+        package = self._package(wpid)
+        task = self._task(package["task_id"])
+        if act is not None:
+            if act.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+                if (
+                    package.get("assigned_junior_agent") != act.name
+                    and package.get("assigned_pro_agent") != act.name
+                    and package.get("claimed_by_agent") != act.name
+                ):
+                    raise OrchestratorError(f"Worker {act.name} is not authorized to read work package {wpid}")
+            elif act.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+                if not self._is_authorized_for_project(act, int(task["project_id"]), task_id=int(task["id"])):
+                    raise OrchestratorError(f"Actor {act.name!r} is not authorized for work package {wpid}")
+        return self._format_package(package)
+
+    def get_task(self, actor_or_id: ActorIdentity | int, task_id: int | None = None, actor: ActorIdentity | None = None) -> dict[str, Any]:
+        act, tid = self._resolve_read_args(actor_or_id, task_id, actor)
+        if tid is None:
+            raise OrchestratorError("task_id is required")
+        task = self._task(tid)
+        if act is not None:
+            if act.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+                assigned = self.store.fetchone(
+                    """SELECT COUNT(*) FROM work_packages
+                       WHERE task_id = ? AND (assigned_junior_agent = ? OR assigned_pro_agent = ? OR claimed_by_agent = ?)""",
+                    (tid, act.name, act.name, act.name),
+                )
+                if assigned is None or assigned[0] == 0:
+                    raise OrchestratorError(f"Worker {act.name} is not authorized to read task {tid}")
+            elif act.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+                if not self._is_authorized_for_project(act, int(task["project_id"]), task_id=tid):
+                    raise OrchestratorError(f"Actor {act.name!r} is not authorized for task {tid}")
+        task_dict = dict(task)
         for field in ("constraints", "non_goals", "acceptance_criteria", "allowed_files", "forbidden_files"):
-            task[field] = _loads(task.pop(f"{field}_json"))
-        packages = self.store.fetchall("SELECT * FROM work_packages WHERE task_id = ? ORDER BY id", (task_id,))
-        task["work_packages"] = [self.get_work_package(item["id"]) for item in packages]
-        artifacts = self.store.fetchall("SELECT * FROM grace_artifacts WHERE task_id = ? ORDER BY id", (task_id,))
-        task["grace_artifacts"] = [dict(item) for item in artifacts]
+            task_dict[field] = _loads(task_dict.pop(f"{field}_json"))
+        packages = self.store.fetchall("SELECT * FROM work_packages WHERE task_id = ? ORDER BY id", (tid,))
+        task_dict["work_packages"] = [self._format_package(dict(item)) for item in packages]
+        artifacts = self.store.fetchall("SELECT * FROM grace_artifacts WHERE task_id = ? ORDER BY id", (tid,))
+        task_dict["grace_artifacts"] = [dict(item) for item in artifacts]
         reviews = self.store.fetchall(
             "SELECT * FROM reviews WHERE (target_type = 'task' AND target_id = ?) OR target_id IN (SELECT id FROM work_packages WHERE task_id = ?) ORDER BY id DESC",
-            (task_id, task_id),
+            (tid, tid),
         )
-        task["reviews"] = [dict(item) for item in reviews]
+        task_dict["reviews"] = [dict(item) for item in reviews]
         sessions = self.store.fetchall(
-            "SELECT id FROM mimo_sessions WHERE task_id = ? ORDER BY id", (task_id,)
+            "SELECT id FROM mimo_sessions WHERE task_id = ? ORDER BY id", (tid,)
         )
-        task["mimo_sessions"] = [self.get_mimo_session(int(item["id"])) for item in sessions]
+        task_dict["mimo_sessions"] = [self.get_mimo_session(int(item["id"]), actor=act) for item in sessions]
         submissions = self.store.fetchall(
             "SELECT * FROM submissions WHERE work_package_id IN (SELECT id FROM work_packages WHERE task_id = ?) ORDER BY id",
-            (task_id,),
+            (tid,),
         )
-        task["submissions"] = [
+        task_dict["submissions"] = [
             {
                 **dict(item),
                 "tests_run": _loads(str(item["tests_run_json"])),
@@ -3258,10 +3790,20 @@ class OrchestratorService:
             }
             for item in submissions
         ]
-        return task
+        return task_dict
 
-    def list_audit(self, task_id: int | None = None) -> list[dict[str, Any]]:
-        if task_id is None:
+    def list_audit(self, actor_or_task: ActorIdentity | int | None = None, task_id: int | None = None, actor: ActorIdentity | None = None) -> list[dict[str, Any]]:
+        act, tid = self._resolve_read_args(actor_or_task, task_id, actor)
+        if act is not None:
+            if act.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+                raise OrchestratorError(f"Worker role {act.primary_role.value} is not authorized to access audit logs")
+            if act.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+                if tid is None:
+                    raise OrchestratorError("GLM and Test Owner roles require a specific task_id for audit logs")
+                task = self._task(tid)
+                if not self._is_authorized_for_project(act, int(task["project_id"]), task_id=tid):
+                    raise OrchestratorError(f"Actor {act.name!r} is not authorized for task {tid} audit log")
+        if tid is None:
             rows = self.store.fetchall("SELECT * FROM audit_log ORDER BY id")
         else:
             rows = self.store.fetchall(
@@ -3271,14 +3813,21 @@ class OrchestratorService:
                    OR target_id IN (SELECT id FROM reviews WHERE target_type = 'task' AND target_id = ?)
                    OR target_id IN (SELECT id FROM mimo_sessions WHERE task_id = ?)
                    ORDER BY id""",
-                (task_id, task_id, task_id, task_id, task_id),
+                (tid, tid, tid, tid, tid),
             )
         return [{**dict(row), "payload": _loads(str(row["payload_json"]))} for row in rows]
 
-    def get_orchestrator_status_snapshot(self, project_id: int | None = None) -> dict[str, Any]:
+    def get_orchestrator_status_snapshot(self, actor_or_project: ActorIdentity | int | None = None, project_id: int | None = None, actor: ActorIdentity | None = None) -> dict[str, Any]:
         """Build a consistent, read-only status snapshot of projects, tasks, packages, and sessions."""
-        if project_id is not None:
-            projects_rows = self.store.fetchall("SELECT * FROM projects WHERE id = ? ORDER BY id", (project_id,))
+        act, pid = self._resolve_read_args(actor_or_project, project_id, actor)
+        if act is not None:
+            if act.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+                raise OrchestratorError(f"Worker role {act.primary_role.value} is not authorized to read status snapshots")
+            if act.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+                if pid is None or not self._is_authorized_for_project(act, pid):
+                    raise OrchestratorError("GLM and Test Owner roles require project authorization for status snapshots")
+        if pid is not None:
+            projects_rows = self.store.fetchall("SELECT * FROM projects WHERE id = ? ORDER BY id", (pid,))
         else:
             projects_rows = self.store.fetchall("SELECT * FROM projects ORDER BY id")
 
@@ -3312,10 +3861,13 @@ class OrchestratorService:
             "recent_audit_events": [dict(a) for a in recent_audits],
         }
 
-    def get_task_summary(self, task_id: int) -> dict[str, Any]:
+    def get_task_summary(self, actor_or_id: ActorIdentity | int, task_id: int | None = None, actor: ActorIdentity | None = None) -> dict[str, Any]:
         """Return a compact, structured summary of a task and its packages with recommended next_action."""
-        task = self._task(task_id)
-        pkgs_rows = self.store.fetchall("SELECT id, title, status FROM work_packages WHERE task_id = ? ORDER BY id", (task_id,))
+        act, tid = self._resolve_read_args(actor_or_id, task_id, actor)
+        if tid is None:
+            raise OrchestratorError("task_id is required")
+        task = self.get_task(tid, actor=act)
+        pkgs_rows = self.store.fetchall("SELECT id, title, status FROM work_packages WHERE task_id = ? ORDER BY id", (tid,))
 
         active_ids = []
         blocked_ids = []
@@ -3352,12 +3904,15 @@ class OrchestratorService:
             "next_action": next_act,
         }
 
-    def get_work_package_summary(self, package_id: int) -> dict[str, Any]:
+    def get_work_package_summary(self, actor_or_id: ActorIdentity | int, package_id: int | None = None, actor: ActorIdentity | None = None) -> dict[str, Any]:
         """Return a compact summary of a work package."""
-        pkg = self._package(package_id)
+        act, wpid = self._resolve_read_args(actor_or_id, package_id, actor)
+        if wpid is None:
+            raise OrchestratorError("work_package_id is required")
+        pkg = self.get_work_package(wpid, actor=act)
         sessions_rows = self.store.fetchall(
             "SELECT id, assigned_agent, assigned_role, mode, lifecycle_state, pid FROM mimo_sessions WHERE work_package_id = ? ORDER BY id DESC LIMIT 5",
-            (package_id,),
+            (wpid,),
         )
         return {
             "id": pkg["id"],
@@ -3371,12 +3926,15 @@ class OrchestratorService:
             "updated_at": pkg["updated_at"],
         }
 
-    def list_handoff_events_page(self, work_package_id: int, after_event_id: str | None = None, limit: int = 20) -> dict[str, Any]:
+    def list_handoff_events_page(self, actor_or_id: ActorIdentity | int, work_package_id: int | None = None, after_event_id: str | None = None, limit: int = 20, actor: ActorIdentity | None = None) -> dict[str, Any]:
         """Paginated event retrieval for work package handoffs."""
+        act, wpid = self._resolve_read_args(actor_or_id, work_package_id, actor)
+        if wpid is None:
+            raise OrchestratorError("work_package_id is required")
         clamped_limit = max(1, min(limit, 200))
-        package = self._package(work_package_id)
+        package = self.get_work_package(wpid, actor=act)
         task = self._task(package["task_id"])
-        _, events_path, _ = self._handoff_paths(task["project_id"], task["id"], work_package_id)
+        _, events_path, _ = self._handoff_paths(task["project_id"], task["id"], wpid)
 
         if not events_path.is_file():
             return {
@@ -3422,9 +3980,18 @@ class OrchestratorService:
             "limit": clamped_limit,
         }
 
-
-    def list_audit_page(self, task_id: int | None = None, after_audit_id: int = 0, limit: int = 20) -> dict[str, Any]:
+    def list_audit_page(self, actor_or_task: ActorIdentity | int | None = None, task_id: int | None = None, after_audit_id: int = 0, limit: int = 20, actor: ActorIdentity | None = None) -> dict[str, Any]:
         """Paginated audit log retrieval."""
+        act, tid = self._resolve_read_args(actor_or_task, task_id, actor)
+        if act is not None:
+            if act.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
+                raise OrchestratorError(f"Worker role {act.primary_role.value} is not authorized to access audit logs")
+            if act.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
+                if tid is None:
+                    raise OrchestratorError("GLM and Test Owner roles require a specific task_id for audit logs")
+                task = self._task(tid)
+                if not self._is_authorized_for_project(act, int(task["project_id"]), task_id=tid):
+                    raise OrchestratorError(f"Actor {act.name!r} is not authorized for task {tid} audit log")
         clamped_limit = max(1, min(limit, 200))
         if task_id is None:
             rows = self.store.fetchall(
@@ -3645,7 +4212,12 @@ class OrchestratorService:
         pkg = self._package(sub["work_package_id"])
         task = self._task(pkg["task_id"])
         if actor.primary_role in {OrchestratorRole.WORKER_JUNIOR, OrchestratorRole.WORKER_PRO}:
-            if sub.get("worker_agent") != actor.name and pkg.get("claimed_by_agent") != actor.name:
+            if (
+                sub.get("submitted_by_agent") != actor.name
+                and pkg.get("claimed_by_agent") != actor.name
+                and pkg.get("assigned_junior_agent") != actor.name
+                and pkg.get("assigned_pro_agent") != actor.name
+            ):
                 raise OrchestratorError(f"Worker {actor.name} is not authorized to read submission {submission_id}")
         elif actor.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
             self._authorize(actor, OrchestratorRole.GLM, task["project_id"], task["id"])
@@ -3659,7 +4231,14 @@ class OrchestratorService:
         if row is None:
             raise OrchestratorError(f"Review not found: {review_id}")
         rev = dict(row)
-        task = self._task(rev["task_id"])
+        if rev["target_type"] == "task":
+            task_id = int(rev["target_id"])
+        elif rev["target_type"] == "work_package":
+            pkg = self._package(int(rev["target_id"]))
+            task_id = int(pkg["task_id"])
+        else:
+            raise OrchestratorError(f"Unknown review target_type: {rev['target_type']}")
+        task = self._task(task_id)
         if actor.primary_role in {OrchestratorRole.GLM, OrchestratorRole.TEST_OWNER}:
             self._authorize(actor, OrchestratorRole.GLM, task["project_id"], task["id"])
         return rev
